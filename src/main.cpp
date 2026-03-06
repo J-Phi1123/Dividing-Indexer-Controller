@@ -6,7 +6,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
-#include "Stepper.h"
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <mbedtls/aes.h>
@@ -63,8 +62,6 @@ Preferences prefs;
 TwoWire i2cBus = TwoWire(0);
 Adafruit_SSD1306 display(OLED_W, OLED_H, &i2cBus, -1);
 Adafruit_NeoPixel rgbLeds(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
-constexpr int STEPPER_LIB_STEPS_PER_REV = 100;
-Stepper stepper(STEPPER_LIB_STEPS_PER_REV, STEPPER_IN1, STEPPER_IN2, STEPPER_IN3, STEPPER_IN4);
 
 // Runtime state
 volatile bool button1Pressed = false;
@@ -79,9 +76,13 @@ unsigned long lastDisplayMs = 0;
 constexpr long STEPS_PER_INDEXER_REV = 200L * 20L * 40L;
 int numberOfGears = 40;
 long ticksPerGear = 4000;
-constexpr uint16_t SINGLE_STEP_PULSE_US = 2500;
-constexpr uint16_t SINGLE_STEP_SETTLE_MS = 25;
-unsigned long lastSingleStepMs = 0;
+int phaseIndex = 0;
+bool tbInStandby = true;
+unsigned long lastMotionMs = 0;
+unsigned long lastStepUs = 0;
+uint32_t stepIntervalUs = 10000;
+constexpr uint16_t TB_STANDBY_WAKE_US = 30;
+constexpr uint16_t TB_IDLE_STANDBY_MS = 120;
 
 // Debounce state
 bool lastBtn1Read = HIGH;
@@ -110,6 +111,7 @@ NetworkConfig savedConfig;
 void hardDisableStepperPins();
 void hardEnableStepperPins();
 void applyStepperSpeed();
+void setStepperPhase(int phase);
 
 void recalcIndexerTicks() {
   if (numberOfGears < 1) {
@@ -127,12 +129,13 @@ float getIndexerDegrees() {
 }
 
 void applyStepperSpeed() {
-  // Stepper::setSpeed expects RPM for configured steps/rev.
-  long rpm = lround((speedStepsPerSec * 60.0f) / static_cast<float>(STEPPER_LIB_STEPS_PER_REV));
-  if (rpm < 1) {
-    rpm = 1;
+  if (speedStepsPerSec < 1.0f) {
+    speedStepsPerSec = 1.0f;
   }
-  stepper.setSpeed(rpm);
+  stepIntervalUs = static_cast<uint32_t>(1000000.0f / speedStepsPerSec);
+  if (stepIntervalUs < 200) {
+    stepIntervalUs = 200;
+  }
 }
 
 void runStepperToTargetOneStep() {
@@ -141,15 +144,30 @@ void runStepperToTargetOneStep() {
   }
   if (stepperOutputsReleased && stepperPosition != targetPosition) {
     hardEnableStepperPins();
-    applyStepperSpeed();
     Serial.println("[STEP] outputs re-enabled for queued motion");
   }
   if (stepperPosition == targetPosition) {
+    if (!tbInStandby && millis() - lastMotionMs > TB_IDLE_STANDBY_MS) {
+      hardDisableStepperPins();
+    }
     return;
   }
+
+  if (tbInStandby) {
+    hardEnableStepperPins();
+  }
+
+  unsigned long nowUs = micros();
+  if (nowUs - lastStepUs < stepIntervalUs) {
+    return;
+  }
+
   int dir = (targetPosition > stepperPosition) ? 1 : -1;
-  stepper.step(dir);
+  phaseIndex = (phaseIndex + dir + 4) % 4;
+  setStepperPhase(phaseIndex);
   stepperPosition += dir;
+  lastStepUs = nowUs;
+  lastMotionMs = millis();
 }
 
 const char* wifiDisconnectReasonName(uint8_t reason) {
@@ -211,16 +229,38 @@ void setFirstLedColor(uint8_t r, uint8_t g, uint8_t b) {
   rgbLeds.show();
 }
 
+enum class BridgeMode : uint8_t { Stop = 0, Forward, Reverse, Brake };
+
+void setBridgeMode(uint8_t in1Pin, uint8_t in2Pin, BridgeMode mode) {
+  switch (mode) {
+    case BridgeMode::Forward:
+      digitalWrite(in1Pin, HIGH);
+      digitalWrite(in2Pin, LOW);
+      break;
+    case BridgeMode::Reverse:
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, HIGH);
+      break;
+    case BridgeMode::Brake:
+      digitalWrite(in1Pin, HIGH);
+      digitalWrite(in2Pin, HIGH);
+      break;
+    default:
+      digitalWrite(in1Pin, LOW);
+      digitalWrite(in2Pin, LOW);
+      break;
+  }
+}
+
 void hardDisableStepperPins() {
-  // Keep H-bridge inputs in a defined low state to prevent floating/ticking.
+  // TB67H450: IN1=L and IN2=L enters STOP, then STANDBY after ~1 ms.
   pinMode(STEPPER_IN1, OUTPUT);
   pinMode(STEPPER_IN2, OUTPUT);
   pinMode(STEPPER_IN3, OUTPUT);
   pinMode(STEPPER_IN4, OUTPUT);
-  digitalWrite(STEPPER_IN1, LOW);
-  digitalWrite(STEPPER_IN2, LOW);
-  digitalWrite(STEPPER_IN3, LOW);
-  digitalWrite(STEPPER_IN4, LOW);
+  setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Stop);
+  setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Stop);
+  tbInStandby = true;
   stepperOutputsReleased = true;
 }
 
@@ -229,7 +269,33 @@ void hardEnableStepperPins() {
   pinMode(STEPPER_IN2, OUTPUT);
   pinMode(STEPPER_IN3, OUTPUT);
   pinMode(STEPPER_IN4, OUTPUT);
+  // Wake outputs from standby and restore phase.
+  setStepperPhase(phaseIndex);
+  delayMicroseconds(TB_STANDBY_WAKE_US);
+  tbInStandby = false;
   stepperOutputsReleased = false;
+}
+
+void setStepperPhase(int phase) {
+  // Two TB67H450 bridges drive a bipolar stepper in full-step two-phase mode.
+  switch ((phase % 4 + 4) % 4) {
+    case 0:
+      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Forward);
+      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Forward);
+      break;
+    case 1:
+      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Reverse);
+      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Forward);
+      break;
+    case 2:
+      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Reverse);
+      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Reverse);
+      break;
+    default:
+      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Forward);
+      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Reverse);
+      break;
+  }
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -714,31 +780,12 @@ void handleStepperSingleStep() {
     server.send(409, "text/plain", "Stepper is disabled");
     return;
   }
-  unsigned long now = millis();
-  if (now - lastSingleStepMs < SINGLE_STEP_SETTLE_MS) {
-    Serial.println("[STEP] single step rejected: still settling");
-    server.send(429, "text/plain", "Motor settling, try again");
-    return;
-  }
   int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
-  int delta = (dir < 0) ? -1 : 1;
-  targetPosition = stepperPosition;
-  hardEnableStepperPins();
-  stepper.step(delta);
-  stepperPosition += delta;
-  targetPosition = stepperPosition;
-  delayMicroseconds(SINGLE_STEP_PULSE_US);
-  delay(SINGLE_STEP_SETTLE_MS);
-  hardDisableStepperPins();
-  lastSingleStepMs = millis();
-  Serial.print("[STEP] single step dir=");
+  targetPosition = stepperPosition + ((dir < 0) ? -1L : 1L);
+  Serial.print("[STEP] single queued dir=");
   Serial.print(dir);
-  Serial.print(" pos=");
-  Serial.print(stepperPosition);
-  Serial.print(" pulse_us=");
-  Serial.print(SINGLE_STEP_PULSE_US);
-  Serial.print(" settle_ms=");
-  Serial.println(SINGLE_STEP_SETTLE_MS);
+  Serial.print(" target=");
+  Serial.println(targetPosition);
   server.send(200, "text/plain", "OK");
 }
 
@@ -1105,15 +1152,13 @@ void setup() {
   Serial.print(STEPPER_IN3);
   Serial.print("/");
   Serial.println(STEPPER_IN4);
-  Serial.println("[BOOT] stepper mode=FULL4WIRE");
+  Serial.println("[BOOT] stepper mode=TB67H450 phase-drive");
   Serial.print("[BOOT] default speed=");
   Serial.println(speedStepsPerSec);
   Serial.print("[BOOT] default accel=");
   Serial.println(accelStepsPerSec2);
-  Serial.print("[BOOT] single_step pulse_us=");
-  Serial.print(SINGLE_STEP_PULSE_US);
-  Serial.print(" settle_ms=");
-  Serial.println(SINGLE_STEP_SETTLE_MS);
+  Serial.print("[BOOT] standby wake us=");
+  Serial.println(TB_STANDBY_WAKE_US);
 
   pinMode(BTN1_PIN, INPUT_PULLUP);
   pinMode(BTN2_PIN, INPUT_PULLUP);
@@ -1133,7 +1178,7 @@ void setup() {
   applyStepperSpeed();
   stepperPosition = 0;
   targetPosition = 0;
-  hardEnableStepperPins();
+  hardDisableStepperPins();
   recalcIndexerTicks();
 
   rgbLeds.begin();

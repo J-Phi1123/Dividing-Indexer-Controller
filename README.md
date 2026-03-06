@@ -50,9 +50,15 @@ Notes:
 - `ticks_per_gear = round((200 * 20 * 40) / number_of_gears)`
 
 ## Stepper Drive Backend
-- Motor movement now uses local `src/Stepper.cpp` / `src/Stepper.h` from the maker `stepperTest` project.
+- Motor movement uses a TB67H450-specific phase controller based on datasheet input truth table.
+- Per bridge input modes:
+  - `H/L`: Forward
+  - `L/H`: Reverse
+  - `H/H`: Brake
+  - `L/L`: Stop (Hi-Z), transitions to standby after about `1 ms`
+- Controller uses two bridge channels (Stepper1/2 pair) in full-step two-phase drive and enforces standby wake delay (`30 us` max spec).
 - `speed` is active.
-- `accel` is accepted by the UI/API for compatibility but the Stepper backend does not implement acceleration ramps.
+- `accel` is accepted by the UI/API for compatibility but no acceleration ramp is currently applied.
 
 ## AP Mode Network Provisioning
 When STA connection fails, device starts AP mode and the webpage shows:
