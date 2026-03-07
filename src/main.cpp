@@ -945,7 +945,9 @@ String htmlPage() {
   h += F("</style></head><body><div class='shell'><h1 class='title'>Divider Indexer Controller</h1>");
   h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button></div>");
   h += F("<div id='settingsPanel' class='card settings'><div class='row'><input id='speed' type='number' value='5500' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
-  h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div></div>");
+  h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
+  h += F("<div class='row'><input id='setPosDeg' type='number' value='0' min='0' max='360' step='0.001'><button class='secondary' onclick='setPositionDeg()'>Set Position (deg)</button></div>");
+  h += F("<div class='row'><button class='secondary' onclick='zeroPosition()'>Zero Position</button></div></div>");
   h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
@@ -1024,6 +1026,8 @@ String htmlPage() {
   h += F("function markDirty(id){dirtyFields.add(id);}function clearDirty(id){dirtyFields.delete(id);}");
   h += F("async function setSpeed(){const s=document.getElementById('speed').value||5500;const r=await fetch('/stepper/speed?value='+s,{method:'POST'});if(r.ok)clearDirty('speed');refresh();}");
   h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;const r=await fetch('/stepper/accel?value='+a,{method:'POST'});if(r.ok)clearDirty('accel');refresh();}");
+  h += F("async function setPositionDeg(){const d=document.getElementById('setPosDeg').value||0;const r=await fetch('/indexer/set_position_deg?value='+encodeURIComponent(d),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function zeroPosition(){const r=await fetch('/indexer/zero',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
   h += F("function onMoveUnitChanged(){const u=document.getElementById('moveUnit').value;const lbl=document.getElementById('moveLabel');const m=document.getElementById('moveAmount');");
   h += F("if(lbl){lbl.innerText=(u==='degrees')?'Step Degrees':'Total Gears';}if(m){m.min=(u==='degrees')?'0.001':'1';m.step=(u==='degrees')?'0.001':'1';}}");
@@ -1039,11 +1043,12 @@ String htmlPage() {
   h += F("if(j.moveUnit==='degrees'){const step=Number(j.moveAmount)||1;curDeg=Number(j.indexerDeg)||0;prevDeg=wrapDeg(curDeg-step);nextDeg=wrapDeg(curDeg+step);");
   h += F("prev=`${prevDeg.toFixed(3)} deg`;cur=`${curDeg.toFixed(3)} deg`;next=`${nextDeg.toFixed(3)} deg`;}");
   h += F("else{const gears=Math.max(1,parseInt(j.gears)||1);const stepDeg=360/gears;const eps=1e-6;curDeg=wrapDeg(Number(j.indexerDeg)||0);");
-  h += F("let prevGear=-1,nextGear=-1;let prevW=-1,nextW=361;");
-  h += F("for(let g=1;g<=gears;g++){let d=g*stepDeg;let w=wrapDeg(d);if(w<curDeg-eps&&w>prevW){prevW=w;prevGear=g;prevDeg=d;}if(w>curDeg+eps&&w<nextW){nextW=w;nextGear=g;nextDeg=d;}}");
-  h += F("if(prevGear<0){for(let g=1;g<=gears;g++){let d=g*stepDeg;let w=wrapDeg(d);if(w>prevW){prevW=w;prevGear=g;prevDeg=d;}}}");
-  h += F("if(nextGear<0){for(let g=1;g<=gears;g++){let d=g*stepDeg;let w=wrapDeg(d);if(w<nextW){nextW=w;nextGear=g;nextDeg=d;}}}");
-  h += F("const p=prevGear,n=nextGear;prev=`G${p}/${gears} (~${prevDeg.toFixed(1)} deg)`;cur=`${curDeg.toFixed(3)} deg`;next=`G${n}/${gears} (~${nextDeg.toFixed(1)} deg)`;}");
+  h += F("const idx=Math.floor(curDeg/stepDeg);const lineDeg=idx*stepDeg;const onLine=Math.abs(curDeg-lineDeg)<eps||Math.abs(curDeg)<eps;");
+  h += F("let prevGear=1,nextGear=1;");
+  h += F("if(onLine){const curGear=(idx===0)?gears:idx;prevGear=curGear-1;if(prevGear<1)prevGear=gears;nextGear=curGear+1;if(nextGear>gears)nextGear=1;}");
+  h += F("else{prevGear=(idx===0)?gears:idx;nextGear=prevGear+1;if(nextGear>gears)nextGear=1;}");
+  h += F("prevDeg=(prevGear===gears)?360:(prevGear*stepDeg);nextDeg=nextGear*stepDeg;");
+  h += F("prev=`G${prevGear}/${gears} (~${prevDeg.toFixed(1)} deg)`;cur=`${curDeg.toFixed(3)} deg`;next=`G${nextGear}/${gears} (~${nextDeg.toFixed(1)} deg)`;}");
   h += F("setDialMarker('prevNeedle',prevDeg);setDialMarker('nextNeedle',nextDeg);");
   h += F("const el=document.getElementById('dialCtx');if(el){el.innerHTML=`Prev: ${prev}<br>Cur: ${cur}<br>Next: ${next}`;}}");
   h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(!el)return;if(document.activeElement===el||dirtyFields.has(id))return;el.value=val;}");
@@ -1274,6 +1279,48 @@ void handleMoveConfig() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleIndexerZero() {
+  noInterrupts();
+  stepperPosition = 0;
+  targetPosition = 0;
+  commandedStepsFromZero = 0.0;
+  timerMotionActive = false;
+  interrupts();
+  Serial.println("[INDEX] zeroed current position reference");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleIndexerSetPositionDeg() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing value");
+    return;
+  }
+  float deg = server.arg("value").toFloat();
+  if (std::isnan(deg) || std::isinf(deg)) {
+    server.send(400, "text/plain", "Invalid degree value");
+    return;
+  }
+  while (deg < 0.0f) {
+    deg += 360.0f;
+  }
+  while (deg >= 360.0f) {
+    deg -= 360.0f;
+  }
+
+  long pos = lround((static_cast<double>(deg) * static_cast<double>(STEPS_PER_INDEXER_REV)) / 360.0);
+  noInterrupts();
+  stepperPosition = pos;
+  targetPosition = pos;
+  commandedStepsFromZero = static_cast<double>(pos);
+  timerMotionActive = false;
+  interrupts();
+  Serial.print("[INDEX] set position deg=");
+  Serial.print(deg, 3);
+  Serial.print(" steps=");
+  Serial.println(pos);
+  server.send(200, "text/plain", "OK");
+}
+
 bool parseIpArg(const String& s, IPAddress& out) {
   return out.fromString(s);
 }
@@ -1344,6 +1391,8 @@ void setupWeb() {
   server.on("/stepper/accel", HTTP_POST, handleStepperAccel);
   server.on("/indexer/step", HTTP_POST, handleIndexerStep);
   server.on("/indexer/set_gears", HTTP_POST, handleIndexerSetGears);
+  server.on("/indexer/zero", HTTP_POST, handleIndexerZero);
+  server.on("/indexer/set_position_deg", HTTP_POST, handleIndexerSetPositionDeg);
   server.on("/move/config", HTTP_POST, handleMoveConfig);
   server.on("/config/network", HTTP_POST, handleSaveNetworkConfig);
   server.begin();
