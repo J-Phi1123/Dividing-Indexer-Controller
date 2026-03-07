@@ -82,7 +82,7 @@ volatile bool stepperEnabled = true;
 bool stepperOutputsReleased = false;
 volatile long stepperPosition = 0;
 volatile long targetPosition = 0;
-float speedStepsPerSec = 3500.0f;
+float speedStepsPerSec = 5500.0f;
 float accelStepsPerSec2 = 7000.0f;
 float currentSpeedStepsPerSec = 5.0f;
 unsigned long lastDisplayMs = 0;
@@ -171,6 +171,14 @@ long computeIndexedAbsoluteTargetFromCurrent(long currentPos, int dir, MoveUnit 
   double stepSpan = 0.0;
   if (unit == MoveUnit::Degrees) {
     stepSpan = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) / 360.0;
+    if (stepSpan < 0.000001) {
+      return currentPos;
+    }
+    long delta = lround(stepSpan);
+    if (delta < 1) {
+      delta = 1;
+    }
+    return currentPos + ((dir > 0) ? delta : -delta);
   } else {
     if (numberOfGears < 1) {
       return currentPos;
@@ -183,13 +191,23 @@ long computeIndexedAbsoluteTargetFromCurrent(long currentPos, int dir, MoveUnit 
   }
 
   const double pos = static_cast<double>(currentPos);
+  const double q = pos / stepSpan;
+  const double eps = 1e-9;
   double index = 0.0;
   if (dir > 0) {
-    index = std::floor(pos / stepSpan) + 1.0;
+    index = std::floor(q + eps) + 1.0;
   } else {
-    index = std::ceil(pos / stepSpan) - 1.0;
+    index = std::ceil(q - eps) - 1.0;
   }
-  return lround(index * stepSpan);
+  long absTarget = lround(index * stepSpan);
+  if (absTarget == currentPos) {
+    long minDelta = lround(stepSpan);
+    if (minDelta < 1) {
+      minDelta = 1;
+    }
+    absTarget = currentPos + ((dir > 0) ? minDelta : -minDelta);
+  }
+  return absTarget;
 }
 
 inline uint64_t timerTicksFromUs(uint32_t us) {
@@ -231,6 +249,52 @@ float getIndexerDegrees() {
     modPos += STEPS_PER_INDEXER_REV;
   }
   return (static_cast<float>(modPos) * 360.0f) / static_cast<float>(STEPS_PER_INDEXER_REV);
+}
+
+int getCurrentGearFromPosition(long pos) {
+  long modPos = pos % STEPS_PER_INDEXER_REV;
+  if (modPos < 0) {
+    modPos += STEPS_PER_INDEXER_REV;
+  }
+  int currentGear = 1;
+  if (ticksPerGear > 0 && numberOfGears > 0) {
+    currentGear = static_cast<int>(modPos / ticksPerGear) + 1;
+    if (currentGear < 1) {
+      currentGear = 1;
+    } else if (currentGear > numberOfGears) {
+      currentGear = numberOfGears;
+    }
+  }
+  return currentGear;
+}
+
+void renderOledStatus() {
+  if (!oledReady) {
+    return;
+  }
+
+  const long pos = getStepperPositionAtomic();
+  const float curDeg = getIndexerDegrees();
+  String lineCur;
+
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    lineCur = "Cur " + String(curDeg, 2) + " deg";
+  } else {
+    const int curGear = getCurrentGearFromPosition(pos);
+    lineCur = "Cur G " + String(curGear) + "/" + String(numberOfGears);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  // Use a larger GFX font (~1.5x vs default) for IP + current status.
+  display.setFont(&FreeSans9pt7b);
+  display.setCursor(0, 14);
+  display.print(ipAddr.toString());
+  display.setCursor(0, 32);
+  display.print(lineCur);
+  display.setFont(nullptr);
+  display.display();
 }
 
 void applyStepperSpeed() {
@@ -869,6 +933,7 @@ String htmlPage() {
   h += F(":root{--bg1:#f4f7fb;--bg2:#e8eef8;--card:#ffffff;--ink:#1e2b3a;--muted:#5c6b7a;--line:#d9e3ef;--accent:#007f73;--accent2:#0a4f8a;}");
   h += F("*{box-sizing:border-box}body{margin:0;font-family:'Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(180deg,var(--bg1),var(--bg2));color:var(--ink)}");
   h += F(".shell{max-width:980px;margin:0 auto;padding:14px}.title{margin:6px 0 14px;font-size:clamp(1.2rem,4.8vw,2rem);letter-spacing:.02em}");
+  h += F(".topbar{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}.settings{display:none;margin-bottom:12px}");
   h += F(".grid{display:grid;grid-template-columns:1.1fr 1fr;gap:12px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px;box-shadow:0 4px 14px rgba(20,40,60,.08)}");
   h += F(".k{font-size:.82rem;color:var(--muted)}.v{font-size:1.05rem;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}");
   h += F("button,input{font-size:15px;border-radius:10px;border:1px solid #c8d6e8;padding:10px 12px}button{background:#fff;cursor:pointer}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}");
@@ -877,7 +942,11 @@ String htmlPage() {
   h += F(".dialWrap{display:flex;flex-direction:column;align-items:center;gap:6px}.dialDeg{font-size:1.3rem;font-weight:700}.tiny{font-size:.8rem;color:var(--muted)}");
   h += F(".net{margin-top:8px;padding:10px;border:1px dashed #9ab2cc;border-radius:12px;background:#f8fbff}");
   h += F("@media (max-width:800px){.grid{grid-template-columns:1fr}.shell{padding:10px}button,input{flex:1}}");
-  h += F("</style></head><body><div class='shell'><h1 class='title'>Divider Indexer Controller</h1><div class='grid'>");
+  h += F("</style></head><body><div class='shell'><h1 class='title'>Divider Indexer Controller</h1>");
+  h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button></div>");
+  h += F("<div id='settingsPanel' class='card settings'><div class='row'><input id='speed' type='number' value='5500' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
+  h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div></div>");
+  h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
   h += F("<defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#f8fcff'/><stop offset='100%' stop-color='#d9e8f7'/></linearGradient></defs>");
@@ -888,26 +957,35 @@ String htmlPage() {
   h += F("<text x='197' y='130' text-anchor='middle' font-size='14' fill='#2a425c'>90</text>");
   h += F("<text x='125' y='213' text-anchor='middle' font-size='14' fill='#2a425c'>180</text>");
   h += F("<text x='53' y='130' text-anchor='middle' font-size='14' fill='#2a425c'>270</text>");
+  h += F("<line id='prevNeedle' x1='125' y1='125' x2='125' y2='56' stroke='#2f9e44' stroke-width='3' stroke-linecap='round'/>");
+  h += F("<line id='nextNeedle' x1='125' y1='125' x2='125' y2='56' stroke='#2f9e44' stroke-width='3' stroke-linecap='round'/>");
   h += F("<line id='needle' x1='125' y1='125' x2='125' y2='34' stroke='#c62828' stroke-width='4' stroke-linecap='round'/>");
   h += F("<circle cx='125' cy='125' r='7' fill='#17324f'/></svg>");
-  h += F("<div class='dialDeg'><span id='deg'>0.000</span>&deg;</div><div class='tiny'>Indexer Angle</div></div>");
+  h += F("<div class='dialDeg'><span id='deg'>0.000</span>&deg;</div><div class='tiny'>Indexer Angle</div>");
+  h += F("<div class='tiny' id='dialCtx'>Prev: -<br>Cur: -<br>Next: -</div></div>");
   h += F("</div>");
   h += F("<div class='card'><div class='row'><div><div class='k'>Mode</div><div class='v' id='mode'>-</div></div></div>");
   h += F("<div class='status' id='status'>Loading...</div>");
   h += F("<div class='row'><button onclick='cmd(\"/stepper/stop\")'>Stop</button></div>");
-  h += F("<div class='row'><button onclick='singleStep(1)'>+1 Step</button><button onclick='singleStep(-1)'>-1 Step</button></div>");
-  h += F("<div class='row'><input id='speed' type='number' value='3500' min='5' max='10000'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
-  h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
-  h += F("<div class='row'><input id='gears' type='number' value='10' min='1'><button class='secondary' onclick='setGears()'>Set Gears</button></div>");
-  h += F("<div class='row'><select id='moveUnit' onchange='setMoveConfig()'>");
+  h += F("<div class='row'><select id='moveUnit' onchange='onMoveUnitChanged()'>");
   if (uiMoveUnit == MoveUnit::Degrees) {
     h += F("<option value='gears'>Gears</option><option value='degrees' selected>Degrees</option>");
   } else {
     h += F("<option value='gears' selected>Gears</option><option value='degrees'>Degrees</option>");
   }
-  h += F("</select><input id='moveAmount' type='number' value='");
-  h += String(uiMoveAmount, 3);
-  h += F("' min='0.001' step='0.001' onchange='setMoveConfig()'><button class='secondary' onclick='setMoveConfig()'>Set Button Move</button></div>");
+  h += F("</select><span id='moveLabel' class='tiny'>");
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    h += F("Step Degrees");
+  } else {
+    h += F("Total Gears");
+  }
+  h += F("</span><input id='moveAmount' type='number' value='");
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    h += String(uiMoveAmount, 3);
+  } else {
+    h += String(numberOfGears);
+  }
+  h += F("' min='0.001' step='0.001' oninput='markDirty(\"moveAmount\")'><button class='secondary' onclick='setMoveConfig()'>Apply Mode/Value</button></div>");
   h += F("<div class='row'><button id='indexPlusBtn' class='primary' onclick='indexStep(1)'>");
   if (uiMoveUnit == MoveUnit::Degrees) {
     h += F("+Degree");
@@ -921,8 +999,6 @@ String htmlPage() {
     h += F("-1 Gear");
   }
   h += F("</button></div>");
-  h += F("<div class='row'><input id='steps' type='number' value='20000'><button onclick='move(1)'>Move +Steps</button><button onclick='move(-1)'>Move -Steps</button></div>");
-  h += F("<div class='tiny'>ticks_per_gear = round((400 * 20 * 40) / gears)</div>");
   h += F("</div>");
   if (wifiMode == "AP") {
     h += F("<div class='card net' style='grid-column:1 / -1'><h3>STA Network Setup (Saved Encrypted)</h3>");
@@ -943,25 +1019,42 @@ String htmlPage() {
   h += F("</div>");
   h += F("<script>");
   h += F("async function cmd(u){await fetch(u,{method:'POST'});refresh();}");
-  h += F("async function singleStep(dir){const r=await fetch('/stepper/single?dir='+dir,{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
-  h += F("async function move(dir){const s=document.getElementById('steps').value||200;await fetch('/stepper/move?steps='+s+'&dir='+dir,{method:'POST'});refresh();}");
-  h += F("async function setSpeed(){const s=document.getElementById('speed').value||3500;await fetch('/stepper/speed?value='+s,{method:'POST'});refresh();}");
-  h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;await fetch('/stepper/accel?value='+a,{method:'POST'});refresh();}");
+  h += F("function toggleSettings(){const p=document.getElementById('settingsPanel');if(!p)return;p.style.display=(p.style.display==='block')?'none':'block';}");
+  h += F("const dirtyFields=new Set();");
+  h += F("function markDirty(id){dirtyFields.add(id);}function clearDirty(id){dirtyFields.delete(id);}");
+  h += F("async function setSpeed(){const s=document.getElementById('speed').value||5500;const r=await fetch('/stepper/speed?value='+s,{method:'POST'});if(r.ok)clearDirty('speed');refresh();}");
+  h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;const r=await fetch('/stepper/accel?value='+a,{method:'POST'});if(r.ok)clearDirty('accel');refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
-  h += F("async function setGears(){const g=document.getElementById('gears').value||40;await fetch('/indexer/set_gears?value='+g,{method:'POST'});refresh();}");
+  h += F("function onMoveUnitChanged(){const u=document.getElementById('moveUnit').value;const lbl=document.getElementById('moveLabel');const m=document.getElementById('moveAmount');");
+  h += F("if(lbl){lbl.innerText=(u==='degrees')?'Step Degrees':'Total Gears';}if(m){m.min=(u==='degrees')?'0.001':'1';m.step=(u==='degrees')?'0.001':'1';}}");
   h += F("async function setMoveConfig(){const p=new URLSearchParams({unit:document.getElementById('moveUnit').value,amount:document.getElementById('moveAmount').value||'1'});");
-  h += F("const r=await fetch('/move/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("const r=await fetch('/move/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());}else{clearDirty('moveAmount');}refresh();}");
   h += F("async function saveNetwork(){const p=new URLSearchParams({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value,ip:document.getElementById('ip').value,gateway:document.getElementById('gateway').value,netmask:document.getElementById('netmask').value});");
   h += F("const r=await fetch('/config/network',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});alert(await r.text());}");
   h += F("function renderDial(deg){const needle=document.getElementById('needle');needle.setAttribute('transform',`rotate(${deg} 125 125)`);document.getElementById('deg').innerText=Number(deg).toFixed(3);}");
-  h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(document.activeElement!==el){el.value=val;}}");
+  h += F("function wrapDeg(v){let d=v%360;if(d<0)d+=360;return d;}");
+  h += F("function setDialMarker(id,deg){const el=document.getElementById(id);if(el){el.setAttribute('transform',`rotate(${deg} 125 125)`);}}");
+  h += F("function updateDialContext(j){let prev='-',cur='-',next='-';");
+  h += F("let prevDeg=0,curDeg=0,nextDeg=0;");
+  h += F("if(j.moveUnit==='degrees'){const step=Number(j.moveAmount)||1;curDeg=Number(j.indexerDeg)||0;prevDeg=wrapDeg(curDeg-step);nextDeg=wrapDeg(curDeg+step);");
+  h += F("prev=`${prevDeg.toFixed(3)} deg`;cur=`${curDeg.toFixed(3)} deg`;next=`${nextDeg.toFixed(3)} deg`;}");
+  h += F("else{const gears=Math.max(1,parseInt(j.gears)||1);const stepDeg=360/gears;const eps=1e-6;curDeg=wrapDeg(Number(j.indexerDeg)||0);");
+  h += F("let p=Math.floor((curDeg-eps)/stepDeg);if(p<1)p=gears;let n=Math.ceil((curDeg+eps)/stepDeg);if(n>gears)n=1;");
+  h += F("prevDeg=p*stepDeg;nextDeg=n*stepDeg;if(prevDeg>=360)prevDeg=360;if(nextDeg>=360)nextDeg=360;");
+  h += F("prev=`G${p}/${gears} (~${prevDeg.toFixed(1)} deg)`;cur=`${curDeg.toFixed(3)} deg`;next=`G${n}/${gears} (~${nextDeg.toFixed(1)} deg)`;}");
+  h += F("setDialMarker('prevNeedle',prevDeg);setDialMarker('nextNeedle',nextDeg);");
+  h += F("const el=document.getElementById('dialCtx');if(el){el.innerHTML=`Prev: ${prev}<br>Cur: ${cur}<br>Next: ${next}`;}}");
+  h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(!el)return;if(document.activeElement===el||dirtyFields.has(id))return;el.value=val;}");
+  h += F("function updateMoveUi(j){const lbl=document.getElementById('moveLabel');if(lbl){lbl.innerText=(j.moveUnit==='degrees')?'Step Degrees':'Total Gears';}");
+  h += F("const m=document.getElementById('moveAmount');if(!m)return;m.min=(j.moveUnit==='degrees')?'0.001':'1';m.step=(j.moveUnit==='degrees')?'0.001':'1';");
+  h += F("if(document.activeElement!==m&&!dirtyFields.has('moveAmount')){m.value=(j.moveUnit==='degrees')?j.moveAmount:j.gears;}}");
   h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();");
-  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('gears',j.gears);setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('moveAmount',j.moveAmount);");
+  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);updateMoveUi(j);");
   h += F("const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}");
   h += F("document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';");
   h += F("document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';");
-  h += F("document.getElementById('status').innerText=`Pos ${j.position} -> ${j.target}\\nAngle ${Number(j.indexerDeg).toFixed(3)} deg\\nMove ${j.moveAmount} ${j.moveUnit}`;");
-  h += F("renderDial(j.indexerDeg);}");
+  h += F("document.getElementById('status').innerText=`Pos ${j.position} -> ${j.target}\\nAngle ${Number(j.indexerDeg).toFixed(3)} deg\\nMode ${j.moveUnit==='degrees'?(j.moveAmount+' deg'):(''+j.gears+' gears')}`;");
+  h += F("renderDial(j.indexerDeg);updateDialContext(j);}");
   h += F("setInterval(refresh,1000);refresh();");
   h += F("</script></body></html>");
   return h;
@@ -993,41 +1086,7 @@ void handleRoot() { server.send(200, "text/html", htmlPage()); }
 void handleStatus() { sendJsonStatus(); }
 
 void showMovingScreen() {
-  if (!oledReady) {
-    return;
-  }
-  long modPos = stepperPosition % STEPS_PER_INDEXER_REV;
-  if (modPos < 0) {
-    modPos += STEPS_PER_INDEXER_REV;
-  }
-  int currentGear = 1;
-  if (ticksPerGear > 0 && numberOfGears > 0) {
-    currentGear = static_cast<int>(modPos / ticksPerGear) + 1;
-    if (currentGear < 1) {
-      currentGear = 1;
-    } else if (currentGear > numberOfGears) {
-      currentGear = numberOfGears;
-    }
-  }
-
-  String ipText = ipAddr.toString();
-  String statusText;
-  if (uiMoveUnit == MoveUnit::Degrees) {
-    statusText = String(getIndexerDegrees(), 3) + " deg";
-  } else {
-    statusText = String(currentGear) + "/" + String(numberOfGears) + " gear";
-  }
-
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setFont(&FreeSans9pt7b);
-  display.setCursor(0, 14);
-  display.print(ipText);
-  display.setCursor(0, 30);
-  display.print(statusText);
-  display.setFont(nullptr);
-  display.display();
+  renderOledStatus();
 }
 
 void handleStepperStop() {
@@ -1197,6 +1256,13 @@ void handleMoveConfig() {
     uiMoveAmount = amount;
   } else {
     uiMoveUnit = MoveUnit::Gears;
+    int nextGears = static_cast<int>(lround(amount));
+    if (nextGears < 1) {
+      server.send(400, "text/plain", "Gears must be >= 1");
+      return;
+    }
+    numberOfGears = nextGears;
+    recalcIndexerTicks();
     uiMoveAmount = 1.0f;
   }
   Serial.print("[MOVE] unit=");
@@ -1476,38 +1542,7 @@ void updateDisplay() {
   }
   lastDisplayMs = now;
 
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-
-  long modPos = stepperPosition % STEPS_PER_INDEXER_REV;
-  if (modPos < 0) {
-    modPos += STEPS_PER_INDEXER_REV;
-  }
-  int currentGear = 1;
-  if (ticksPerGear > 0 && numberOfGears > 0) {
-    currentGear = static_cast<int>(modPos / ticksPerGear) + 1;
-    if (currentGear < 1) {
-      currentGear = 1;
-    } else if (currentGear > numberOfGears) {
-      currentGear = numberOfGears;
-    }
-  }
-
-  String ipText = ipAddr.toString();
-  String statusText;
-  if (uiMoveUnit == MoveUnit::Degrees) {
-    statusText = String(getIndexerDegrees(), 3) + " deg";
-  } else {
-    statusText = String(currentGear) + "/" + String(numberOfGears) + " gear";
-  }
-  display.setTextSize(1);
-  display.setFont(&FreeSans9pt7b);
-  display.setCursor(0, 14);  // GFXfont cursor is baseline-based
-  display.print(ipText);
-  display.setCursor(0, 30);
-  display.print(statusText);
-  display.setFont(nullptr);
-  display.display();
+  renderOledStatus();
 }
 
 bool initDisplayWithI2cPins(uint8_t sdaPin, uint8_t sclPin) {
