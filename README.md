@@ -9,14 +9,14 @@ ESP32 firmware for:
 - Mobile-friendly UI with live indexer dial
 
 ## Hardware Mapping (current defaults)
-- Stepper (Maker ESP32 `Stepper1`): `GPIO27`, `GPIO13`, `GPIO2`, `GPIO4`
+- Stepper (Maker ESP32 `Stepper2`): `GPIO17`, `GPIO12`, `GPIO15`, `GPIO14`
 - Button 1: `GPIO32` (active-low, uses internal pull-up)
 - Button 2: `GPIO33` (active-low, uses internal pull-up)
 - OLED I2C: `SDA=GPIO4`, `SCL=GPIO5`, address `0x3C`
 - RGB LEDs: `GPIO16` (4 LEDs total; first LED used for status)
 
 Notes:
-- If you switch firmware to `Stepper2`, set the board switch for `M3/M4` to `Motor` mode.
+- For `Stepper2`, set the board switch for `M3/M4` to `Motor` mode.
 - User request said "SSD1036"; this project is configured for `SSD1306` (common 128x64 I2C OLED).
 
 ## Build / Flash (PlatformIO)

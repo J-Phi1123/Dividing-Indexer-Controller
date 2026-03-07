@@ -5,10 +5,15 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Fonts/FreeSans9pt7b.h>
 #include <Adafruit_NeoPixel.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <esp32-hal-timer.h>
+#include <rom/ets_sys.h>
+#include <soc/gpio_struct.h>
 #include <mbedtls/aes.h>
+#include <mbedtls/md.h>
 
 // ===== Wi-Fi settings =====
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
@@ -24,12 +29,18 @@ constexpr uint8_t AES_KEY[32] = {
   0xC8, 0x54, 0x1D, 0xEE, 0x39, 0xAB, 0x6F, 0x92,
   0x04, 0x7B, 0xC1, 0x58, 0xE6, 0x20, 0x9D, 0x13
 };
+constexpr uint8_t HMAC_KEY[32] = {
+  0x9E, 0x12, 0x4D, 0xB6, 0x7F, 0x21, 0x8A, 0x55,
+  0xC3, 0x0B, 0x6E, 0x94, 0x2D, 0xF8, 0x31, 0xA7,
+  0x45, 0xD2, 0x19, 0xEE, 0x63, 0x87, 0x3A, 0xBC,
+  0x08, 0x71, 0x5F, 0xC9, 0x26, 0xD4, 0x90, 0x1B
+};
 
 // ===== Board pin mapping =====
 // Set to 1 for Stepper1 terminal block (M1+M2), or 2 for Stepper2 terminal block (M3+M4).
 // If using Stepper2, keep board switch for M3/M4 in "Motor" mode.
 #ifndef STEPPER_PORT
-#define STEPPER_PORT 1
+#define STEPPER_PORT 2
 #endif
 
 #if STEPPER_PORT == 1
@@ -48,9 +59,9 @@ constexpr uint8_t STEPPER_IN4 = 14;
 constexpr uint8_t BTN1_PIN = 32;
 constexpr uint8_t BTN2_PIN = 33;
 
-// OLED I2C pins (Maker boards often use 4/5 for onboard OLED/I2C headers)
-constexpr uint8_t I2C_SDA_PIN = 4;
-constexpr uint8_t I2C_SCL_PIN = 5;
+// OLED I2C pins
+constexpr uint8_t I2C_SDA_PIN = 21;
+constexpr uint8_t I2C_SCL_PIN = 22;
 constexpr uint8_t OLED_ADDR = 0x3C;
 constexpr int OLED_W = 128;
 constexpr int OLED_H = 64;
@@ -66,23 +77,42 @@ Adafruit_NeoPixel rgbLeds(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // Runtime state
 volatile bool button1Pressed = false;
 volatile bool button2Pressed = false;
-bool stepperEnabled = true;
+volatile bool stepperEnabled = true;
 bool stepperOutputsReleased = false;
-long stepperPosition = 0;
-long targetPosition = 0;
-float speedStepsPerSec = 100.0f;
-float accelStepsPerSec2 = 80.0f;
+volatile long stepperPosition = 0;
+volatile long targetPosition = 0;
+float speedStepsPerSec = 3500.0f;
+float accelStepsPerSec2 = 7000.0f;
+float currentSpeedStepsPerSec = 5.0f;
 unsigned long lastDisplayMs = 0;
-constexpr long STEPS_PER_INDEXER_REV = 200L * 20L * 40L;
-int numberOfGears = 40;
+constexpr long MOTOR_FULL_STEPS_PER_REV = 200L;
+constexpr long COMMUTATION_STATES_PER_FULL_STEP = 2L;  // half-step mode
+constexpr long EFFECTIVE_STEPS_PER_REV = MOTOR_FULL_STEPS_PER_REV * COMMUTATION_STATES_PER_FULL_STEP;
+constexpr long STEPS_PER_INDEXER_REV = EFFECTIVE_STEPS_PER_REV * 20L * 40L;
+int numberOfGears = 10;
 long ticksPerGear = 4000;
-int phaseIndex = 0;
+volatile int phaseIndex = 0;
 bool tbInStandby = true;
-unsigned long lastMotionMs = 0;
-unsigned long lastStepUs = 0;
+unsigned long lastRampUs = 0;
 uint32_t stepIntervalUs = 10000;
 constexpr uint16_t TB_STANDBY_WAKE_US = 30;
-constexpr uint16_t TB_IDLE_STANDBY_MS = 120;
+constexpr uint16_t REVERSAL_DWELL_US = 1;
+constexpr float START_SPEED_STEPS_PER_SEC = 5.0f;
+constexpr float MAX_RAMP_DT_SEC = 0.02f;
+constexpr uint32_t MIN_STEP_INTERVAL_US = 50;  // 20,000 steps/s theoretical limit
+constexpr uint32_t STEPPER_TIMER_IDLE_US = 1000;
+constexpr uint16_t STEPPER_TIMER_DIVIDER = 40;  // 80MHz/40 = 2MHz timer clock
+constexpr uint32_t STEPPER_TIMER_TICKS_PER_US = 2;
+hw_timer_t* stepperTimer = nullptr;
+volatile bool timerMotionActive = false;
+volatile uint32_t timerStepIntervalUs = 10000;
+volatile uint32_t timerStepIntervalRequestUs = 10000;
+volatile bool timerStepIntervalDirty = false;
+volatile int8_t lastStepDir = 0;
+constexpr int8_t OUTPUT_CMD_NONE = 0;
+constexpr int8_t OUTPUT_CMD_STOP = 1;
+constexpr int8_t OUTPUT_CMD_HOLD_PHASE = 2;
+volatile int8_t outputCommand = OUTPUT_CMD_NONE;
 
 // Debounce state
 bool lastBtn1Read = HIGH;
@@ -96,6 +126,7 @@ IPAddress ipAddr;
 IPAddress bootIpAddr;
 bool bootIpCaptured = false;
 bool hasStoredNetworkConfig = false;
+bool oledReady = false;
 
 struct NetworkConfig {
   String ssid;
@@ -107,17 +138,87 @@ struct NetworkConfig {
 
 NetworkConfig savedConfig;
 
+enum class MoveUnit : uint8_t { Gears = 0, Degrees = 1 };
+MoveUnit uiMoveUnit = MoveUnit::Gears;
+float uiMoveAmount = 1.0f;
+double commandedStepsFromZero = 0.0;
+
 // Forward declarations for helper functions used before their definitions.
 void hardDisableStepperPins();
 void hardEnableStepperPins();
 void applyStepperSpeed();
 void setStepperPhase(int phase);
+void showMovingScreen();
+void IRAM_ATTR onStepperTimerISR();
+void IRAM_ATTR writeStepperOutputs(bool in1, bool in2, bool in3, bool in4);
+bool initDisplayWithI2cPins(uint8_t sdaPin, uint8_t sclPin);
+long getStepperPositionAtomic();
+long getTargetPositionAtomic();
+void setTargetAndCommandedAtomic(long value);
+
+long computeIndexedAbsoluteTargetFromZero(int dir, MoveUnit unit, float amount) {
+  if (dir == 0) {
+    return getTargetPositionAtomic();
+  }
+  if (amount < 0.0f) {
+    amount = -amount;
+  }
+  if (amount < 0.000001f) {
+    return getTargetPositionAtomic();
+  }
+
+  double deltaSteps = 0.0;
+  if (unit == MoveUnit::Degrees) {
+    deltaSteps = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) / 360.0;
+  } else {
+    if (numberOfGears < 1) {
+      return getTargetPositionAtomic();
+    }
+    deltaSteps = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) /
+                 static_cast<double>(numberOfGears);
+  }
+  if (dir < 0) {
+    deltaSteps = -deltaSteps;
+  }
+
+  noInterrupts();
+  commandedStepsFromZero += deltaSteps;
+  long absTarget = lround(commandedStepsFromZero);
+  interrupts();
+  return absTarget;
+}
+
+inline uint64_t timerTicksFromUs(uint32_t us) {
+  return static_cast<uint64_t>(us) * STEPPER_TIMER_TICKS_PER_US;
+}
 
 void recalcIndexerTicks() {
   if (numberOfGears < 1) {
     numberOfGears = 1;
   }
-  ticksPerGear = lround((200.0f * 20.0f * 40.0f) / static_cast<float>(numberOfGears));
+  ticksPerGear = lround((static_cast<float>(EFFECTIVE_STEPS_PER_REV) * 20.0f * 40.0f) /
+                        static_cast<float>(numberOfGears));
+}
+
+long getStepperPositionAtomic() {
+  noInterrupts();
+  long pos = stepperPosition;
+  interrupts();
+  return pos;
+}
+
+long getTargetPositionAtomic() {
+  noInterrupts();
+  long tgt = targetPosition;
+  interrupts();
+  return tgt;
+}
+
+void setTargetAndCommandedAtomic(long value) {
+  noInterrupts();
+  targetPosition = value;
+  commandedStepsFromZero = static_cast<double>(value);
+  interrupts();
 }
 
 float getIndexerDegrees() {
@@ -129,45 +230,84 @@ float getIndexerDegrees() {
 }
 
 void applyStepperSpeed() {
-  if (speedStepsPerSec < 1.0f) {
-    speedStepsPerSec = 1.0f;
+  if (speedStepsPerSec < START_SPEED_STEPS_PER_SEC) {
+    speedStepsPerSec = START_SPEED_STEPS_PER_SEC;
   }
   stepIntervalUs = static_cast<uint32_t>(1000000.0f / speedStepsPerSec);
-  if (stepIntervalUs < 200) {
-    stepIntervalUs = 200;
+  if (stepIntervalUs < MIN_STEP_INTERVAL_US) {
+    stepIntervalUs = MIN_STEP_INTERVAL_US;
   }
 }
 
 void runStepperToTargetOneStep() {
   if (!stepperEnabled) {
+    timerMotionActive = false;
+    currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+    if (timerStepIntervalUs != STEPPER_TIMER_IDLE_US) {
+      timerStepIntervalRequestUs = STEPPER_TIMER_IDLE_US;
+      timerStepIntervalDirty = true;
+    }
     return;
   }
-  if (stepperOutputsReleased && stepperPosition != targetPosition) {
-    hardEnableStepperPins();
-    Serial.println("[STEP] outputs re-enabled for queued motion");
-  }
   if (stepperPosition == targetPosition) {
-    if (!tbInStandby && millis() - lastMotionMs > TB_IDLE_STANDBY_MS) {
+    currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+    lastRampUs = micros();
+    timerMotionActive = false;
+    if (timerStepIntervalUs != STEPPER_TIMER_IDLE_US) {
+      timerStepIntervalRequestUs = STEPPER_TIMER_IDLE_US;
+      timerStepIntervalDirty = true;
+    }
+    if (!tbInStandby) {
       hardDisableStepperPins();
+      Serial.println("[THERM] outputs disabled (idle)");
     }
     return;
   }
 
-  if (tbInStandby) {
+  if (stepperOutputsReleased || tbInStandby) {
     hardEnableStepperPins();
+    Serial.println("[STEP] outputs re-enabled for motion");
   }
 
   unsigned long nowUs = micros();
-  if (nowUs - lastStepUs < stepIntervalUs) {
-    return;
+  if (lastRampUs == 0) {
+    lastRampUs = nowUs;
+  }
+  float dt = static_cast<float>(nowUs - lastRampUs) / 1000000.0f;
+  lastRampUs = nowUs;
+  if (dt < 0.0f) {
+    dt = 0.0f;
+  }
+  if (dt > MAX_RAMP_DT_SEC) {
+    dt = MAX_RAMP_DT_SEC;
   }
 
-  int dir = (targetPosition > stepperPosition) ? 1 : -1;
-  phaseIndex = (phaseIndex + dir + 4) % 4;
-  setStepperPhase(phaseIndex);
-  stepperPosition += dir;
-  lastStepUs = nowUs;
-  lastMotionMs = millis();
+  float desiredSpeed = speedStepsPerSec;
+  if (desiredSpeed < START_SPEED_STEPS_PER_SEC) {
+    desiredSpeed = START_SPEED_STEPS_PER_SEC;
+  }
+
+  float dv = accelStepsPerSec2 * dt;
+  if (currentSpeedStepsPerSec < desiredSpeed) {
+    currentSpeedStepsPerSec += dv;
+    if (currentSpeedStepsPerSec > desiredSpeed) {
+      currentSpeedStepsPerSec = desiredSpeed;
+    }
+  }
+  if (currentSpeedStepsPerSec < START_SPEED_STEPS_PER_SEC) {
+    currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+  }
+
+  uint32_t dynIntervalUs = static_cast<uint32_t>(1000000.0f / currentSpeedStepsPerSec);
+  if (dynIntervalUs < MIN_STEP_INTERVAL_US) {
+    dynIntervalUs = MIN_STEP_INTERVAL_US;
+  }
+  if (dynIntervalUs != timerStepIntervalUs) {
+    timerStepIntervalRequestUs = dynIntervalUs;
+    timerStepIntervalDirty = true;
+  }
+
+  timerMotionActive = true;
 }
 
 const char* wifiDisconnectReasonName(uint8_t reason) {
@@ -229,73 +369,113 @@ void setFirstLedColor(uint8_t r, uint8_t g, uint8_t b) {
   rgbLeds.show();
 }
 
-enum class BridgeMode : uint8_t { Stop = 0, Forward, Reverse, Brake };
-
-void setBridgeMode(uint8_t in1Pin, uint8_t in2Pin, BridgeMode mode) {
-  switch (mode) {
-    case BridgeMode::Forward:
-      digitalWrite(in1Pin, HIGH);
-      digitalWrite(in2Pin, LOW);
-      break;
-    case BridgeMode::Reverse:
-      digitalWrite(in1Pin, LOW);
-      digitalWrite(in2Pin, HIGH);
-      break;
-    case BridgeMode::Brake:
-      digitalWrite(in1Pin, HIGH);
-      digitalWrite(in2Pin, HIGH);
-      break;
-    default:
-      digitalWrite(in1Pin, LOW);
-      digitalWrite(in2Pin, LOW);
-      break;
-  }
+void IRAM_ATTR writeStepperOutputs(bool in1, bool in2, bool in3, bool in4) {
+  const uint32_t pin1Mask = (1UL << STEPPER_IN1);
+  const uint32_t pin2Mask = (1UL << STEPPER_IN2);
+  const uint32_t pin3Mask = (1UL << STEPPER_IN3);
+  const uint32_t pin4Mask = (1UL << STEPPER_IN4);
+  const uint32_t allMask = pin1Mask | pin2Mask | pin3Mask | pin4Mask;
+  uint32_t setMask = 0;
+  if (in1) setMask |= pin1Mask;
+  if (in2) setMask |= pin2Mask;
+  if (in3) setMask |= pin3Mask;
+  if (in4) setMask |= pin4Mask;
+  uint32_t clearMask = allMask & (~setMask);
+  GPIO.out_w1tc = clearMask;
+  GPIO.out_w1ts = setMask;
 }
 
 void hardDisableStepperPins() {
-  // TB67H450: IN1=L and IN2=L enters STOP, then STANDBY after ~1 ms.
-  pinMode(STEPPER_IN1, OUTPUT);
-  pinMode(STEPPER_IN2, OUTPUT);
-  pinMode(STEPPER_IN3, OUTPUT);
-  pinMode(STEPPER_IN4, OUTPUT);
-  setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Stop);
-  setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Stop);
+  noInterrupts();
+  // Only ISR writes stepper GPIO states.
+  outputCommand = OUTPUT_CMD_STOP;
+  timerMotionActive = false;
+  lastStepDir = 0;
+  timerStepIntervalRequestUs = STEPPER_TIMER_IDLE_US;
+  timerStepIntervalDirty = true;
+  interrupts();
   tbInStandby = true;
   stepperOutputsReleased = true;
 }
 
 void hardEnableStepperPins() {
-  pinMode(STEPPER_IN1, OUTPUT);
-  pinMode(STEPPER_IN2, OUTPUT);
-  pinMode(STEPPER_IN3, OUTPUT);
-  pinMode(STEPPER_IN4, OUTPUT);
-  // Wake outputs from standby and restore phase.
-  setStepperPhase(phaseIndex);
+  noInterrupts();
+  // Only ISR writes stepper GPIO states.
+  outputCommand = OUTPUT_CMD_HOLD_PHASE;
+  interrupts();
   delayMicroseconds(TB_STANDBY_WAKE_US);
   tbInStandby = false;
   stepperOutputsReleased = false;
 }
 
 void setStepperPhase(int phase) {
-  // Two TB67H450 bridges drive a bipolar stepper in full-step two-phase mode.
-  switch ((phase % 4 + 4) % 4) {
+  // 8-state half-step sequence for smoother commutation.
+  // Note: OFF coil state uses STOP (00) on that H-bridge.
+  switch ((phase % 8 + 8) % 8) {
     case 0:
-      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Forward);
-      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Forward);
+      writeStepperOutputs(true, false, false, false);  // A+, Boff
       break;
     case 1:
-      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Reverse);
-      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Forward);
+      writeStepperOutputs(true, false, true, false);   // A+, B+
       break;
     case 2:
-      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Reverse);
-      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Reverse);
+      writeStepperOutputs(false, false, true, false);  // Aoff, B+
+      break;
+    case 3:
+      writeStepperOutputs(false, true, true, false);   // A-, B+
+      break;
+    case 4:
+      writeStepperOutputs(false, true, false, false);  // A-, Boff
+      break;
+    case 5:
+      writeStepperOutputs(false, true, false, true);   // A-, B-
+      break;
+    case 6:
+      writeStepperOutputs(false, false, false, true);  // Aoff, B-
       break;
     default:
-      setBridgeMode(STEPPER_IN1, STEPPER_IN2, BridgeMode::Forward);
-      setBridgeMode(STEPPER_IN3, STEPPER_IN4, BridgeMode::Reverse);
+      writeStepperOutputs(true, false, false, true);   // A+, B-
       break;
   }
+}
+
+void IRAM_ATTR onStepperTimerISR() {
+  if (timerStepIntervalDirty && stepperTimer != nullptr) {
+    timerStepIntervalUs = timerStepIntervalRequestUs;
+    timerAlarmWrite(stepperTimer, timerTicksFromUs(timerStepIntervalUs), true);
+    timerStepIntervalDirty = false;
+  }
+
+  int8_t cmd = outputCommand;
+  if (cmd == OUTPUT_CMD_STOP) {
+    writeStepperOutputs(false, false, false, false);
+    lastStepDir = 0;
+    outputCommand = OUTPUT_CMD_NONE;
+  } else if (cmd == OUTPUT_CMD_HOLD_PHASE) {
+    setStepperPhase(phaseIndex);
+    outputCommand = OUTPUT_CMD_NONE;
+  }
+
+  if (!timerMotionActive || !stepperEnabled) {
+    return;
+  }
+  long pos = stepperPosition;
+  long tgt = targetPosition;
+  if (pos == tgt) {
+    timerMotionActive = false;
+    return;
+  }
+
+  int dir = (tgt > pos) ? 1 : -1;
+  if (lastStepDir != 0 && dir != lastStepDir && REVERSAL_DWELL_US > 0) {
+    // Apply brief blanking only on direction changes.
+    writeStepperOutputs(false, false, false, false);
+    ets_delay_us(REVERSAL_DWELL_US);
+  }
+  phaseIndex = (phaseIndex + dir + 8) % 8;
+  setStepperPhase(phaseIndex);
+  stepperPosition = pos + dir;
+  lastStepDir = dir;
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -351,6 +531,29 @@ String toHex(const uint8_t* data, size_t len) {
     out += HEX_CHARS[data[i] & 0x0F];
   }
   return out;
+}
+
+bool hmacSha256(const uint8_t* data, size_t len, uint8_t out[32]) {
+  const mbedtls_md_info_t* mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (mdInfo == nullptr) {
+    return false;
+  }
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  bool ok = (mbedtls_md_setup(&ctx, mdInfo, 1) == 0) &&
+            (mbedtls_md_hmac_starts(&ctx, HMAC_KEY, sizeof(HMAC_KEY)) == 0) &&
+            (mbedtls_md_hmac_update(&ctx, data, len) == 0) &&
+            (mbedtls_md_hmac_finish(&ctx, out) == 0);
+  mbedtls_md_free(&ctx);
+  return ok;
+}
+
+bool constantTimeEqual(const uint8_t* a, const uint8_t* b, size_t len) {
+  uint8_t diff = 0;
+  for (size_t i = 0; i < len; i++) {
+    diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+  }
+  return diff == 0;
 }
 
 bool fromHexNibble(char c, uint8_t& out) {
@@ -430,7 +633,8 @@ String encryptAesCbc(const String& plaintext) {
   mbedtls_aes_free(&aes);
   free(encBuf);
 
-  uint8_t* payload = static_cast<uint8_t*>(malloc(sizeof(iv) + paddedLen));
+  const size_t cipherPayloadLen = sizeof(iv) + paddedLen;
+  uint8_t* payload = static_cast<uint8_t*>(malloc(cipherPayloadLen));
   if (payload == nullptr) {
     free(outBuf);
     return String();
@@ -439,14 +643,33 @@ String encryptAesCbc(const String& plaintext) {
   memcpy(payload + sizeof(iv), outBuf, paddedLen);
   free(outBuf);
 
-  String hexPayload = toHex(payload, sizeof(iv) + paddedLen);
+  uint8_t tag[32];
+  if (!hmacSha256(payload, cipherPayloadLen, tag)) {
+    free(payload);
+    return String();
+  }
+  uint8_t* finalPayload = static_cast<uint8_t*>(malloc(cipherPayloadLen + sizeof(tag)));
+  if (finalPayload == nullptr) {
+    free(payload);
+    return String();
+  }
+  memcpy(finalPayload, payload, cipherPayloadLen);
+  memcpy(finalPayload + cipherPayloadLen, tag, sizeof(tag));
   free(payload);
+
+  String hexPayload = toHex(finalPayload, cipherPayloadLen + sizeof(tag));
+  free(finalPayload);
   return hexPayload;
 }
 
 bool decryptAesCbc(const String& cipherHex, String& plaintextOut) {
   const size_t totalBytes = cipherHex.length() / 2;
-  if (cipherHex.length() % 2 != 0 || totalBytes < 32 || ((totalBytes - 16) % 16) != 0) {
+  if (cipherHex.length() % 2 != 0) {
+    return false;
+  }
+  const bool looksLikeAuthFormat = (totalBytes >= 64) && (((totalBytes - 16 - 32) % 16) == 0);
+  const bool looksLikeLegacyFormat = (totalBytes >= 32) && (((totalBytes - 16) % 16) == 0);
+  if (!looksLikeAuthFormat && !looksLikeLegacyFormat) {
     return false;
   }
 
@@ -459,9 +682,27 @@ bool decryptAesCbc(const String& cipherHex, String& plaintextOut) {
     return false;
   }
 
+  size_t cipherPayloadLen = totalBytes;
+  if (looksLikeAuthFormat) {
+    const size_t authTagLen = 32;
+    cipherPayloadLen = totalBytes - authTagLen;
+    uint8_t expectedTag[32];
+    if (!hmacSha256(raw, cipherPayloadLen, expectedTag)) {
+      free(raw);
+      return false;
+    }
+    const uint8_t* providedTag = raw + cipherPayloadLen;
+    if (!constantTimeEqual(expectedTag, providedTag, authTagLen)) {
+      free(raw);
+      return false;
+    }
+  } else {
+    Serial.println("[CFG] decrypt using legacy unauthenticated payload");
+  }
+
   uint8_t iv[16];
   memcpy(iv, raw, sizeof(iv));
-  const size_t cipherLen = totalBytes - sizeof(iv);
+  const size_t cipherLen = cipherPayloadLen - sizeof(iv);
   uint8_t* plain = static_cast<uint8_t*>(malloc(cipherLen));
   if (plain == nullptr) {
     free(raw);
@@ -647,16 +888,37 @@ String htmlPage() {
   h += F("<circle cx='125' cy='125' r='7' fill='#17324f'/></svg>");
   h += F("<div class='dialDeg'><span id='deg'>0.000</span>&deg;</div><div class='tiny'>Indexer Angle</div></div>");
   h += F("</div>");
-  h += F("<div class='card'><div class='row'><div><div class='k'>IP</div><div class='v' id='ip'>-</div></div><div><div class='k'>Mode</div><div class='v' id='mode'>-</div></div></div>");
+  h += F("<div class='card'><div class='row'><div><div class='k'>Mode</div><div class='v' id='mode'>-</div></div></div>");
   h += F("<div class='status' id='status'>Loading...</div>");
-  h += F("<div class='row'><button id='enableBtn' onclick='cmd(\"/stepper/enable\")'>Enable</button><button id='disableBtn' onclick='cmd(\"/stepper/disable\")'>Disable</button><button onclick='cmd(\"/stepper/stop\")'>Stop</button></div>");
+  h += F("<div class='row'><button onclick='cmd(\"/stepper/stop\")'>Stop</button></div>");
   h += F("<div class='row'><button onclick='singleStep(1)'>+1 Step</button><button onclick='singleStep(-1)'>-1 Step</button></div>");
-  h += F("<div class='row'><input id='speed' type='number' value='100' min='5' max='1500'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
-  h += F("<div class='row'><input id='accel' type='number' value='80' min='5' max='3000'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
-  h += F("<div class='row'><input id='gears' type='number' value='40' min='1'><button class='secondary' onclick='setGears()'>Set Gears</button></div>");
-  h += F("<div class='row'><button class='primary' onclick='indexStep(1)'>+1 Gear</button><button class='primary' onclick='indexStep(-1)'>-1 Gear</button></div>");
-  h += F("<div class='row'><input id='steps' type='number' value='200'><button onclick='move(1)'>Move +Steps</button><button onclick='move(-1)'>Move -Steps</button></div>");
-  h += F("<div class='tiny'>ticks_per_gear = round((200 * 20 * 40) / gears)</div>");
+  h += F("<div class='row'><input id='speed' type='number' value='3500' min='5' max='10000'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
+  h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
+  h += F("<div class='row'><input id='gears' type='number' value='10' min='1'><button class='secondary' onclick='setGears()'>Set Gears</button></div>");
+  h += F("<div class='row'><select id='moveUnit' onchange='setMoveConfig()'>");
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    h += F("<option value='gears'>Gears</option><option value='degrees' selected>Degrees</option>");
+  } else {
+    h += F("<option value='gears' selected>Gears</option><option value='degrees'>Degrees</option>");
+  }
+  h += F("</select><input id='moveAmount' type='number' value='");
+  h += String(uiMoveAmount, 3);
+  h += F("' min='0.001' step='0.001' onchange='setMoveConfig()'><button class='secondary' onclick='setMoveConfig()'>Set Button Move</button></div>");
+  h += F("<div class='row'><button id='indexPlusBtn' class='primary' onclick='indexStep(1)'>");
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    h += F("+Degree");
+  } else {
+    h += F("+1 Gear");
+  }
+  h += F("</button><button id='indexMinusBtn' class='primary' onclick='indexStep(-1)'>");
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    h += F("-Degree");
+  } else {
+    h += F("-1 Gear");
+  }
+  h += F("</button></div>");
+  h += F("<div class='row'><input id='steps' type='number' value='20000'><button onclick='move(1)'>Move +Steps</button><button onclick='move(-1)'>Move -Steps</button></div>");
+  h += F("<div class='tiny'>ticks_per_gear = round((400 * 20 * 40) / gears)</div>");
   h += F("</div>");
   if (wifiMode == "AP") {
     h += F("<div class='card net' style='grid-column:1 / -1'><h3>STA Network Setup (Saved Encrypted)</h3>");
@@ -679,18 +941,22 @@ String htmlPage() {
   h += F("async function cmd(u){await fetch(u,{method:'POST'});refresh();}");
   h += F("async function singleStep(dir){const r=await fetch('/stepper/single?dir='+dir,{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function move(dir){const s=document.getElementById('steps').value||200;await fetch('/stepper/move?steps='+s+'&dir='+dir,{method:'POST'});refresh();}");
-  h += F("async function setSpeed(){const s=document.getElementById('speed').value||100;await fetch('/stepper/speed?value='+s,{method:'POST'});refresh();}");
-  h += F("async function setAccel(){const a=document.getElementById('accel').value||80;await fetch('/stepper/accel?value='+a,{method:'POST'});refresh();}");
+  h += F("async function setSpeed(){const s=document.getElementById('speed').value||3500;await fetch('/stepper/speed?value='+s,{method:'POST'});refresh();}");
+  h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;await fetch('/stepper/accel?value='+a,{method:'POST'});refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
   h += F("async function setGears(){const g=document.getElementById('gears').value||40;await fetch('/indexer/set_gears?value='+g,{method:'POST'});refresh();}");
+  h += F("async function setMoveConfig(){const p=new URLSearchParams({unit:document.getElementById('moveUnit').value,amount:document.getElementById('moveAmount').value||'1'});");
+  h += F("const r=await fetch('/move/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function saveNetwork(){const p=new URLSearchParams({ssid:document.getElementById('ssid').value,password:document.getElementById('password').value,ip:document.getElementById('ip').value,gateway:document.getElementById('gateway').value,netmask:document.getElementById('netmask').value});");
   h += F("const r=await fetch('/config/network',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});alert(await r.text());}");
   h += F("function renderDial(deg){const needle=document.getElementById('needle');needle.setAttribute('transform',`rotate(${deg} 125 125)`);document.getElementById('deg').innerText=Number(deg).toFixed(3);}");
   h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(document.activeElement!==el){el.value=val;}}");
   h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();");
-  h += F("document.getElementById('ip').innerText=j.ip;document.getElementById('mode').innerText=j.wifiMode;setIfIdle('gears',j.gears);setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);");
-  h += F("const en=document.getElementById('enableBtn');const dis=document.getElementById('disableBtn');if(j.enabled){en.className='state-on';dis.className='';}else{en.className='';dis.className='state-off';}");
-  h += F("document.getElementById('status').innerText=`Boot IP ${j.bootIp||'-'}\\nPos ${j.position} -> ${j.target} | Enabled ${j.enabled}\\nSpeed ${j.speed} st/s | Accel ${j.accel}\\nGears ${j.gears} | Ticks/Gear ${j.ticksPerGear}\\nB1 ${j.b1} B2 ${j.b2}`;");
+  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('gears',j.gears);setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('moveAmount',j.moveAmount);");
+  h += F("const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}");
+  h += F("document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';");
+  h += F("document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';");
+  h += F("document.getElementById('status').innerText=`Pos ${j.position} -> ${j.target}\\nAngle ${Number(j.indexerDeg).toFixed(3)} deg\\nMove ${j.moveAmount} ${j.moveUnit}`;");
   h += F("renderDial(j.indexerDeg);}");
   h += F("setInterval(refresh,1000);refresh();");
   h += F("</script></body></html>");
@@ -708,6 +974,8 @@ void sendJsonStatus() {
   json += "\"indexerDeg\":" + String(getIndexerDegrees(), 3) + ",";
   json += "\"gears\":" + String(numberOfGears) + ",";
   json += "\"ticksPerGear\":" + String(ticksPerGear) + ",";
+  json += "\"moveUnit\":\"" + String(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears") + "\",";
+  json += "\"moveAmount\":" + String(uiMoveAmount, 3) + ",";
   json += "\"speed\":" + String(speedStepsPerSec, 1) + ",";
   json += "\"accel\":" + String(accelStepsPerSec2, 1) + ",";
   json += "\"b1\":" + String(button1Pressed ? "true" : "false") + ",";
@@ -720,26 +988,50 @@ void sendJsonStatus() {
 void handleRoot() { server.send(200, "text/html", htmlPage()); }
 void handleStatus() { sendJsonStatus(); }
 
-void handleStepperEnable() {
-  Serial.println("[HTTP] /stepper/enable");
-  hardEnableStepperPins();
-  stepperEnabled = true;
-  applyStepperSpeed();
-  Serial.println("[STEP] enabled=true");
-  server.send(200, "text/plain", "OK");
-}
+void showMovingScreen() {
+  if (!oledReady) {
+    return;
+  }
+  long modPos = stepperPosition % STEPS_PER_INDEXER_REV;
+  if (modPos < 0) {
+    modPos += STEPS_PER_INDEXER_REV;
+  }
+  int currentGear = 1;
+  if (ticksPerGear > 0 && numberOfGears > 0) {
+    currentGear = static_cast<int>(modPos / ticksPerGear) + 1;
+    if (currentGear < 1) {
+      currentGear = 1;
+    } else if (currentGear > numberOfGears) {
+      currentGear = numberOfGears;
+    }
+  }
 
-void handleStepperDisable() {
-  Serial.println("[HTTP] /stepper/disable");
-  stepperEnabled = false;
-  targetPosition = stepperPosition;
-  hardDisableStepperPins();
-  Serial.println("[STEP] enabled=false; stop requested");
-  server.send(200, "text/plain", "OK");
+  String ipText = ipAddr.toString();
+  String statusText;
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    statusText = String(getIndexerDegrees(), 3) + " deg";
+  } else {
+    statusText = String(currentGear) + "/" + String(numberOfGears) + " gear";
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setFont(&FreeSans9pt7b);
+  display.setCursor(0, 14);
+  display.print(ipText);
+  display.setCursor(0, 30);
+  display.print(statusText);
+  display.setFont(nullptr);
+  display.display();
 }
 
 void handleStepperStop() {
-  targetPosition = stepperPosition;
+  noInterrupts();
+  long pos = stepperPosition;
+  targetPosition = pos;
+  commandedStepsFromZero = static_cast<double>(pos);
+  interrupts();
   server.send(200, "text/plain", "OK");
 }
 
@@ -763,13 +1055,18 @@ void handleStepperMove() {
     steps = -steps;
   }
 
+  long currentPos = getStepperPositionAtomic();
   if (stepperOutputsReleased) {
     hardEnableStepperPins();
     applyStepperSpeed();
   }
-  targetPosition = stepperPosition + steps;
+  long nextTarget = currentPos + steps;
+  if (nextTarget != currentPos) {
+    showMovingScreen();
+  }
+  setTargetAndCommandedAtomic(nextTarget);
   Serial.print("[STEP] move target=");
-  Serial.println(targetPosition);
+  Serial.println(nextTarget);
   server.send(200, "text/plain", "OK");
 }
 
@@ -781,11 +1078,16 @@ void handleStepperSingleStep() {
     return;
   }
   int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
-  targetPosition = stepperPosition + ((dir < 0) ? -1L : 1L);
+  long currentPos = getStepperPositionAtomic();
+  long nextTarget = currentPos + ((dir < 0) ? -1L : 1L);
+  if (nextTarget != currentPos) {
+    showMovingScreen();
+  }
+  setTargetAndCommandedAtomic(nextTarget);
   Serial.print("[STEP] single queued dir=");
   Serial.print(dir);
   Serial.print(" target=");
-  Serial.println(targetPosition);
+  Serial.println(nextTarget);
   server.send(200, "text/plain", "OK");
 }
 
@@ -798,11 +1100,16 @@ void handleStepperSpeed() {
   if (v < 5.0f) {
     v = 5.0f;
   }
-  if (v > 1500.0f) {
-    v = 1500.0f;
+  if (v > 10000.0f) {
+    v = 10000.0f;
   }
   speedStepsPerSec = v;
   applyStepperSpeed();
+  // Retune ISR cadence immediately to the selected fixed speed.
+  noInterrupts();
+  timerStepIntervalRequestUs = stepIntervalUs;
+  timerStepIntervalDirty = true;
+  interrupts();
   Serial.print("[STEP] speed=");
   Serial.println(speedStepsPerSec);
   server.send(200, "text/plain", "OK");
@@ -817,13 +1124,12 @@ void handleStepperAccel() {
   if (a < 5.0f) {
     a = 5.0f;
   }
-  if (a > 3000.0f) {
-    a = 3000.0f;
+  if (a > 10000.0f) {
+    a = 10000.0f;
   }
   accelStepsPerSec2 = a;
   Serial.print("[STEP] accel=");
-  Serial.print(accelStepsPerSec2);
-  Serial.println(" (Stepper library has no acceleration ramp)");
+  Serial.println(accelStepsPerSec2);
   server.send(200, "text/plain", "OK");
 }
 
@@ -835,18 +1141,26 @@ void handleIndexerStep() {
     return;
   }
   int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
-  long delta = (dir < 0) ? -ticksPerGear : ticksPerGear;
+  long currentPos = getStepperPositionAtomic();
+  long nextTarget = computeIndexedAbsoluteTargetFromZero(dir, uiMoveUnit, uiMoveAmount);
   if (stepperOutputsReleased) {
     hardEnableStepperPins();
     applyStepperSpeed();
   }
-  targetPosition = stepperPosition + delta;
+  if (nextTarget != currentPos) {
+    showMovingScreen();
+  }
+  noInterrupts();
+  targetPosition = nextTarget;
+  interrupts();
   Serial.print("[STEP] index dir=");
   Serial.print(dir);
-  Serial.print(" ticksPerGear=");
-  Serial.print(ticksPerGear);
+  Serial.print(" unit=");
+  Serial.print(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears");
+  Serial.print(" amount=");
+  Serial.print(uiMoveAmount, 3);
   Serial.print(" target=");
-  Serial.println(targetPosition);
+  Serial.println(nextTarget);
   server.send(200, "text/plain", "OK");
 }
 
@@ -862,6 +1176,30 @@ void handleIndexerSetGears() {
   }
   numberOfGears = nextGears;
   recalcIndexerTicks();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleMoveConfig() {
+  if (!server.hasArg("unit") || !server.hasArg("amount")) {
+    server.send(400, "text/plain", "Missing unit or amount");
+    return;
+  }
+  String unit = server.arg("unit");
+  float amount = server.arg("amount").toFloat();
+  if (amount <= 0.0f) {
+    server.send(400, "text/plain", "Amount must be > 0");
+    return;
+  }
+  if (unit == "degrees") {
+    uiMoveUnit = MoveUnit::Degrees;
+  } else {
+    uiMoveUnit = MoveUnit::Gears;
+  }
+  uiMoveAmount = amount;
+  Serial.print("[MOVE] unit=");
+  Serial.print(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears");
+  Serial.print(" amount=");
+  Serial.println(uiMoveAmount, 3);
   server.send(200, "text/plain", "OK");
 }
 
@@ -928,8 +1266,6 @@ void handleSaveNetworkConfig() {
 void setupWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
-  server.on("/stepper/enable", HTTP_POST, handleStepperEnable);
-  server.on("/stepper/disable", HTTP_POST, handleStepperDisable);
   server.on("/stepper/stop", HTTP_POST, handleStepperStop);
   server.on("/stepper/move", HTTP_POST, handleStepperMove);
   server.on("/stepper/single", HTTP_POST, handleStepperSingleStep);
@@ -937,6 +1273,7 @@ void setupWeb() {
   server.on("/stepper/accel", HTTP_POST, handleStepperAccel);
   server.on("/indexer/step", HTTP_POST, handleIndexerStep);
   server.on("/indexer/set_gears", HTTP_POST, handleIndexerSetGears);
+  server.on("/move/config", HTTP_POST, handleMoveConfig);
   server.on("/config/network", HTTP_POST, handleSaveNetworkConfig);
   server.begin();
 }
@@ -1084,21 +1421,39 @@ void handleButtonActions() {
   static bool lastActionB2 = false;
 
   if (button1Pressed && !lastActionB1) {
+    long currentPos = getStepperPositionAtomic();
     if (stepperOutputsReleased) {
       hardEnableStepperPins();
       applyStepperSpeed();
     }
-    targetPosition = stepperPosition + ticksPerGear;
-    Serial.print("[BTN] B1 action: +1 gear, target=");
+    long nextTarget = computeIndexedAbsoluteTargetFromZero(-1, uiMoveUnit, uiMoveAmount);  // B1 rewinds
+    if (nextTarget != currentPos) {
+      showMovingScreen();
+    }
+    noInterrupts();
+    targetPosition = nextTarget;
+    interrupts();
+    Serial.print("[BTN] B1 action: rewind ");
+    Serial.print(uiMoveAmount, 3);
+    Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
     Serial.println(targetPosition);
   }
   if (button2Pressed && !lastActionB2) {
+    long currentPos = getStepperPositionAtomic();
     if (stepperOutputsReleased) {
       hardEnableStepperPins();
       applyStepperSpeed();
     }
-    targetPosition = stepperPosition - ticksPerGear;
-    Serial.print("[BTN] B2 action: -1 gear, target=");
+    long nextTarget = computeIndexedAbsoluteTargetFromZero(1, uiMoveUnit, uiMoveAmount);  // B2 advances
+    if (nextTarget != currentPos) {
+      showMovingScreen();
+    }
+    noInterrupts();
+    targetPosition = nextTarget;
+    interrupts();
+    Serial.print("[BTN] B2 action: advance ");
+    Serial.print(uiMoveAmount, 3);
+    Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
     Serial.println(targetPosition);
   }
 
@@ -1107,33 +1462,86 @@ void handleButtonActions() {
 }
 
 void updateDisplay() {
+  if (!oledReady) {
+    return;
+  }
+
   unsigned long now = millis();
-  if (now - lastDisplayMs < 200) {
+  bool moving = (stepperPosition != targetPosition);
+  if (moving) {
+    return;
+  }
+  unsigned long refreshMs = 200;
+  if (now - lastDisplayMs < refreshMs) {
     return;
   }
   lastDisplayMs = now;
 
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.print("IP:");
-  display.println(ipAddr);
-  display.print("WiFi:");
-  display.println(wifiMode);
-  display.print("Pos:");
-  display.print(stepperPosition);
-  display.print(" T:");
-  display.println(targetPosition);
-  display.print("Deg:");
-  display.println(getIndexerDegrees(), 2);
-  display.print("Spd:");
-  display.println(speedStepsPerSec, 0);
-  display.print("B1:");
-  display.print(button1Pressed ? "P" : "-");
-  display.print(" B2:");
-  display.println(button2Pressed ? "P" : "-");
+
+  long modPos = stepperPosition % STEPS_PER_INDEXER_REV;
+  if (modPos < 0) {
+    modPos += STEPS_PER_INDEXER_REV;
+  }
+  int currentGear = 1;
+  if (ticksPerGear > 0 && numberOfGears > 0) {
+    currentGear = static_cast<int>(modPos / ticksPerGear) + 1;
+    if (currentGear < 1) {
+      currentGear = 1;
+    } else if (currentGear > numberOfGears) {
+      currentGear = numberOfGears;
+    }
+  }
+
+  String ipText = ipAddr.toString();
+  String statusText;
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    statusText = String(getIndexerDegrees(), 3) + " deg";
+  } else {
+    statusText = String(currentGear) + "/" + String(numberOfGears) + " gear";
+  }
+  display.setTextSize(1);
+  display.setFont(&FreeSans9pt7b);
+  display.setCursor(0, 14);  // GFXfont cursor is baseline-based
+  display.print(ipText);
+  display.setCursor(0, 30);
+  display.print(statusText);
+  display.setFont(nullptr);
   display.display();
+}
+
+bool initDisplayWithI2cPins(uint8_t sdaPin, uint8_t sclPin) {
+  Serial.print("[OLED] trying I2C SDA/SCL=");
+  Serial.print(sdaPin);
+  Serial.print("/");
+  Serial.println(sclPin);
+
+  i2cBus.begin(sdaPin, sclPin, 100000);
+  i2cBus.beginTransmission(OLED_ADDR);
+  uint8_t err = i2cBus.endTransmission();
+  if (err != 0) {
+    Serial.print("[OLED] address 0x3C not found, I2C err=");
+    Serial.println(err);
+    return false;
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("[OLED] display.begin failed at 0x3C");
+    return false;
+  }
+
+  Serial.println("[OLED] initialized at 0x3C");
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setFont(&FreeSans9pt7b);
+  display.setCursor(0, 28);
+  display.println("Booting...");
+  display.setFont(nullptr);
+  display.display();
+  oledReady = true;
+  return true;
 }
 
 void setup() {
@@ -1162,24 +1570,42 @@ void setup() {
 
   pinMode(BTN1_PIN, INPUT_PULLUP);
   pinMode(BTN2_PIN, INPUT_PULLUP);
+  pinMode(STEPPER_IN1, OUTPUT);
+  pinMode(STEPPER_IN2, OUTPUT);
+  pinMode(STEPPER_IN3, OUTPUT);
+  pinMode(STEPPER_IN4, OUTPUT);
 
-  i2cBus.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("SSD1306 init failed");
-  } else {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("Booting...");
-    display.display();
+  bool oledOk = initDisplayWithI2cPins(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (!oledOk) {
+    Serial.println("[OLED] primary I2C bus init failed");
+  }
+  if (!oledOk) {
+    Serial.println("[OLED] init failed on configured I2C pins");
+    oledReady = false;
   }
 
   applyStepperSpeed();
+  currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+  lastRampUs = micros();
   stepperPosition = 0;
   targetPosition = 0;
+  commandedStepsFromZero = 0.0;
+  timerMotionActive = false;
+  timerStepIntervalUs = stepIntervalUs;
+  timerStepIntervalRequestUs = stepIntervalUs;
+  timerStepIntervalDirty = false;
   hardDisableStepperPins();
   recalcIndexerTicks();
+
+  stepperTimer = timerBegin(0, STEPPER_TIMER_DIVIDER, true);
+  if (stepperTimer != nullptr) {
+    timerAttachInterrupt(stepperTimer, &onStepperTimerISR, false);
+    timerAlarmWrite(stepperTimer, timerTicksFromUs(STEPPER_TIMER_IDLE_US), true);
+    timerAlarmEnable(stepperTimer);
+    Serial.println("[STEP] hardware timer ISR started");
+  } else {
+    Serial.println("[STEP] failed to create hardware timer");
+  }
 
   rgbLeds.begin();
   rgbLeds.clear();
@@ -1197,9 +1623,33 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
-  readButtons();
-  handleButtonActions();
+  static unsigned long lastBackgroundUs = 0;
+  static unsigned long lastMotionLogMs = 0;
+  bool moving = stepperEnabled && (stepperPosition != targetPosition);
+
+  if (moving && millis() - lastMotionLogMs >= 1000) {
+    uint32_t activeIntervalUs = 0;
+    uint32_t requestedIntervalUs = 0;
+    noInterrupts();
+    activeIntervalUs = timerStepIntervalUs;
+    requestedIntervalUs = timerStepIntervalRequestUs;
+    interrupts();
+    float activeStepsPerSec = (activeIntervalUs > 0) ? (1000000.0f / static_cast<float>(activeIntervalUs)) : 0.0f;
+    float activeRpm = (activeStepsPerSec * 60.0f) / static_cast<float>(EFFECTIVE_STEPS_PER_REV);
+    Serial.print("[MOTION] cmdSpeed=");
+    Serial.print(speedStepsPerSec, 1);
+    Serial.print(" curSpeed=");
+    Serial.print(currentSpeedStepsPerSec, 1);
+    Serial.print(" reqIntUs=");
+    Serial.print(requestedIntervalUs);
+    Serial.print(" actIntUs=");
+    Serial.print(activeIntervalUs);
+    Serial.print(" actHz=");
+    Serial.print(activeStepsPerSec, 1);
+    Serial.print(" actRPM=");
+    Serial.println(activeRpm, 1);
+    lastMotionLogMs = millis();
+  }
 
   if (stepperEnabled) {
     runStepperToTargetOneStep();
@@ -1208,6 +1658,21 @@ void loop() {
     if (!stepperOutputsReleased) {
       hardDisableStepperPins();
     }
+  }
+
+  // While moving, prioritize stepping and run background tasks at a lower rate.
+  if (moving) {
+    unsigned long nowUs = micros();
+    if (nowUs - lastBackgroundUs >= 20000) {  // 20 ms background service budget
+      server.handleClient();
+      readButtons();
+      handleButtonActions();
+      lastBackgroundUs = nowUs;
+    }
+  } else {
+    server.handleClient();
+    readButtons();
+    handleButtonActions();
   }
 
   updateDisplay();
