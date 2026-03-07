@@ -986,17 +986,17 @@ String htmlPage() {
     h += String(numberOfGears);
   }
   h += F("' min='0.001' step='0.001' oninput='markDirty(\"moveAmount\")'><button class='secondary' onclick='setMoveConfig()'>Apply Mode/Value</button></div>");
-  h += F("<div class='row'><button id='indexPlusBtn' class='primary' onclick='indexStep(1)'>");
-  if (uiMoveUnit == MoveUnit::Degrees) {
-    h += F("+Degree");
-  } else {
-    h += F("+1 Gear");
-  }
-  h += F("</button><button id='indexMinusBtn' class='primary' onclick='indexStep(-1)'>");
+  h += F("<div class='row'><button id='indexMinusBtn' class='primary' onclick='indexStep(-1)'>");
   if (uiMoveUnit == MoveUnit::Degrees) {
     h += F("-Degree");
   } else {
     h += F("-1 Gear");
+  }
+  h += F("</button><button id='indexPlusBtn' class='primary' onclick='indexStep(1)'>");
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    h += F("+Degree");
+  } else {
+    h += F("+1 Gear");
   }
   h += F("</button></div>");
   h += F("</div>");
@@ -1039,9 +1039,11 @@ String htmlPage() {
   h += F("if(j.moveUnit==='degrees'){const step=Number(j.moveAmount)||1;curDeg=Number(j.indexerDeg)||0;prevDeg=wrapDeg(curDeg-step);nextDeg=wrapDeg(curDeg+step);");
   h += F("prev=`${prevDeg.toFixed(3)} deg`;cur=`${curDeg.toFixed(3)} deg`;next=`${nextDeg.toFixed(3)} deg`;}");
   h += F("else{const gears=Math.max(1,parseInt(j.gears)||1);const stepDeg=360/gears;const eps=1e-6;curDeg=wrapDeg(Number(j.indexerDeg)||0);");
-  h += F("let p=Math.floor((curDeg-eps)/stepDeg);if(p<1)p=gears;let n=Math.ceil((curDeg+eps)/stepDeg);if(n>gears)n=1;");
-  h += F("prevDeg=p*stepDeg;nextDeg=n*stepDeg;if(prevDeg>=360)prevDeg=360;if(nextDeg>=360)nextDeg=360;");
-  h += F("prev=`G${p}/${gears} (~${prevDeg.toFixed(1)} deg)`;cur=`${curDeg.toFixed(3)} deg`;next=`G${n}/${gears} (~${nextDeg.toFixed(1)} deg)`;}");
+  h += F("let prevGear=-1,nextGear=-1;let prevW=-1,nextW=361;");
+  h += F("for(let g=1;g<=gears;g++){let d=g*stepDeg;let w=wrapDeg(d);if(w<curDeg-eps&&w>prevW){prevW=w;prevGear=g;prevDeg=d;}if(w>curDeg+eps&&w<nextW){nextW=w;nextGear=g;nextDeg=d;}}");
+  h += F("if(prevGear<0){for(let g=1;g<=gears;g++){let d=g*stepDeg;let w=wrapDeg(d);if(w>prevW){prevW=w;prevGear=g;prevDeg=d;}}}");
+  h += F("if(nextGear<0){for(let g=1;g<=gears;g++){let d=g*stepDeg;let w=wrapDeg(d);if(w<nextW){nextW=w;nextGear=g;nextDeg=d;}}}");
+  h += F("const p=prevGear,n=nextGear;prev=`G${p}/${gears} (~${prevDeg.toFixed(1)} deg)`;cur=`${curDeg.toFixed(3)} deg`;next=`G${n}/${gears} (~${nextDeg.toFixed(1)} deg)`;}");
   h += F("setDialMarker('prevNeedle',prevDeg);setDialMarker('nextNeedle',nextDeg);");
   h += F("const el=document.getElementById('dialCtx');if(el){el.innerHTML=`Prev: ${prev}<br>Cur: ${cur}<br>Next: ${next}`;}}");
   h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(!el)return;if(document.activeElement===el||dirtyFields.has(id))return;el.value=val;}");
