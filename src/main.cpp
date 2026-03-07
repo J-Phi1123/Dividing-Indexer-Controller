@@ -14,6 +14,7 @@
 #include <soc/gpio_struct.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
+#include <cmath>
 
 // ===== Wi-Fi settings =====
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
@@ -156,36 +157,39 @@ long getStepperPositionAtomic();
 long getTargetPositionAtomic();
 void setTargetAndCommandedAtomic(long value);
 
-long computeIndexedAbsoluteTargetFromZero(int dir, MoveUnit unit, float amount) {
+long computeIndexedAbsoluteTargetFromCurrent(long currentPos, int dir, MoveUnit unit, float amount) {
   if (dir == 0) {
-    return getTargetPositionAtomic();
+    return currentPos;
   }
   if (amount < 0.0f) {
     amount = -amount;
   }
   if (amount < 0.000001f) {
-    return getTargetPositionAtomic();
+    return currentPos;
   }
 
-  double deltaSteps = 0.0;
+  double stepSpan = 0.0;
   if (unit == MoveUnit::Degrees) {
-    deltaSteps = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) / 360.0;
+    stepSpan = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) / 360.0;
   } else {
     if (numberOfGears < 1) {
-      return getTargetPositionAtomic();
+      return currentPos;
     }
-    deltaSteps = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) /
-                 static_cast<double>(numberOfGears);
+    // Gear mode is always one gear per click (+1 Gear / -1 Gear).
+    stepSpan = static_cast<double>(STEPS_PER_INDEXER_REV) / static_cast<double>(numberOfGears);
   }
-  if (dir < 0) {
-    deltaSteps = -deltaSteps;
+  if (stepSpan < 0.000001) {
+    return currentPos;
   }
 
-  noInterrupts();
-  commandedStepsFromZero += deltaSteps;
-  long absTarget = lround(commandedStepsFromZero);
-  interrupts();
-  return absTarget;
+  const double pos = static_cast<double>(currentPos);
+  double index = 0.0;
+  if (dir > 0) {
+    index = std::floor(pos / stepSpan) + 1.0;
+  } else {
+    index = std::ceil(pos / stepSpan) - 1.0;
+  }
+  return lround(index * stepSpan);
 }
 
 inline uint64_t timerTicksFromUs(uint32_t us) {
@@ -1142,7 +1146,7 @@ void handleIndexerStep() {
   }
   int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
   long currentPos = getStepperPositionAtomic();
-  long nextTarget = computeIndexedAbsoluteTargetFromZero(dir, uiMoveUnit, uiMoveAmount);
+  long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, dir, uiMoveUnit, uiMoveAmount);
   if (stepperOutputsReleased) {
     hardEnableStepperPins();
     applyStepperSpeed();
@@ -1150,9 +1154,7 @@ void handleIndexerStep() {
   if (nextTarget != currentPos) {
     showMovingScreen();
   }
-  noInterrupts();
-  targetPosition = nextTarget;
-  interrupts();
+  setTargetAndCommandedAtomic(nextTarget);
   Serial.print("[STEP] index dir=");
   Serial.print(dir);
   Serial.print(" unit=");
@@ -1192,10 +1194,11 @@ void handleMoveConfig() {
   }
   if (unit == "degrees") {
     uiMoveUnit = MoveUnit::Degrees;
+    uiMoveAmount = amount;
   } else {
     uiMoveUnit = MoveUnit::Gears;
+    uiMoveAmount = 1.0f;
   }
-  uiMoveAmount = amount;
   Serial.print("[MOVE] unit=");
   Serial.print(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears");
   Serial.print(" amount=");
@@ -1426,13 +1429,11 @@ void handleButtonActions() {
       hardEnableStepperPins();
       applyStepperSpeed();
     }
-    long nextTarget = computeIndexedAbsoluteTargetFromZero(-1, uiMoveUnit, uiMoveAmount);  // B1 rewinds
+    long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, -1, uiMoveUnit, uiMoveAmount);  // B1 rewinds
     if (nextTarget != currentPos) {
       showMovingScreen();
     }
-    noInterrupts();
-    targetPosition = nextTarget;
-    interrupts();
+    setTargetAndCommandedAtomic(nextTarget);
     Serial.print("[BTN] B1 action: rewind ");
     Serial.print(uiMoveAmount, 3);
     Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
@@ -1444,13 +1445,11 @@ void handleButtonActions() {
       hardEnableStepperPins();
       applyStepperSpeed();
     }
-    long nextTarget = computeIndexedAbsoluteTargetFromZero(1, uiMoveUnit, uiMoveAmount);  // B2 advances
+    long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, 1, uiMoveUnit, uiMoveAmount);  // B2 advances
     if (nextTarget != currentPos) {
       showMovingScreen();
     }
-    noInterrupts();
-    targetPosition = nextTarget;
-    interrupts();
+    setTargetAndCommandedAtomic(nextTarget);
     Serial.print("[BTN] B2 action: advance ");
     Serial.print(uiMoveAmount, 3);
     Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
