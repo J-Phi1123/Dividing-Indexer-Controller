@@ -105,6 +105,7 @@ constexpr uint16_t TB_STANDBY_WAKE_US = 30;
 constexpr uint16_t REVERSAL_DWELL_US = 1;
 constexpr float START_SPEED_STEPS_PER_SEC = 5.0f;
 constexpr float MAX_RAMP_DT_SEC = 0.02f;
+constexpr bool HBRIDGE_DC_TEST_MODE = false;  // Legacy compile-time test mode (keep disabled).
 constexpr bool USE_HIGH_TORQUE_MODE = false;
 constexpr float HIGH_TORQUE_SPEED_THRESHOLD_STEPS_PER_SEC = 2500.0f;
 constexpr uint32_t MIN_STEP_INTERVAL_US = 50;  // 20,000 steps/s theoretical limit
@@ -112,6 +113,7 @@ constexpr uint32_t STEPPER_TIMER_IDLE_US = 1000;
 constexpr uint16_t STEPPER_TIMER_DIVIDER = 40;  // 80MHz/40 = 2MHz timer clock
 constexpr uint32_t STEPPER_TIMER_TICKS_PER_US = 2;
 hw_timer_t* stepperTimer = nullptr;
+int stepperTimerIndex = -1;
 volatile bool timerMotionActive = false;
 volatile uint32_t timerStepIntervalUs = 10000;
 volatile uint32_t timerStepIntervalRequestUs = 10000;
@@ -168,6 +170,8 @@ uint32_t diagStepRatePerSec = 0;
 long missedStepEstimate = 0;
 enum class OledPage : uint8_t { Status = 0, Motion = 1, Diag = 2, Setup = 3 };
 OledPage oledPage = OledPage::Status;
+enum class DiagBridgeMode : uint8_t { Off = 0, M3On = 1, M4On = 2 };
+DiagBridgeMode diagBridgeMode = DiagBridgeMode::Off;
 enum class SetupStage : uint8_t { Zero = 0, Mode = 1, Value = 2 };
 SetupStage setupStage = SetupStage::Zero;
 MoveUnit setupMoveUnit = MoveUnit::Gears;
@@ -186,6 +190,8 @@ MotionPreset presets[3];
 // Forward declarations for helper functions used before their definitions.
 void hardDisableStepperPins();
 void hardEnableStepperPins();
+void forceBothHBridgesOn();
+void applyDiagBridgeModeOutput();
 void applyStepperSpeed();
 void setStepperPhase(int phase);
 uint32_t computeTimerIntervalUsForSpeed(float speed, bool highTorqueMode);
@@ -206,6 +212,8 @@ void beginOledSetupWizard();
 void handleSetupWizardButtons(bool b1Edge, bool b3Edge, bool b4Edge);
 void syncDegreeIdealToPosition(long pos);
 long computeDegreeModeTarget(long currentPos, int dir, float amount);
+void handleDiagResetIsd();
+void handleDiagBridgeMode();
 
 long modPositive(long value, long mod) {
   long out = value % mod;
@@ -811,6 +819,29 @@ void hardEnableStepperPins() {
   stepperOutputsReleased = false;
 }
 
+void forceBothHBridgesOn() {
+  // Drive both bridges in one direction continuously for meter checks.
+  writeStepperOutputs(true, false, true, false);  // A+, B+
+  tbInStandby = false;
+  stepperOutputsReleased = false;
+}
+
+void applyDiagBridgeModeOutput() {
+  if (diagBridgeMode == DiagBridgeMode::Off) {
+    return;
+  }
+  if (tbInStandby || stepperOutputsReleased) {
+    hardEnableStepperPins();
+  }
+  if (diagBridgeMode == DiagBridgeMode::M3On) {
+    // M3 bridge ON: IN1=H, IN2=L
+    writeStepperOutputs(true, false, false, false);
+  } else if (diagBridgeMode == DiagBridgeMode::M4On) {
+    // M4 bridge ON: IN3=H, IN4=L
+    writeStepperOutputs(false, false, true, false);
+  }
+}
+
 void setStepperPhase(int phase) {
   // 8-state half-step sequence for smoother commutation.
   // Note: OFF coil state uses STOP (00) on that H-bridge.
@@ -1319,7 +1350,7 @@ String htmlPage() {
   h += F("<div class='row'><input id='p1name' placeholder='Preset 1 name'><button class='secondary' onclick='presetSave(1)'>Save P1</button><button class='secondary' onclick='presetLoad(1)'>Load P1</button></div>");
   h += F("<div class='row'><input id='p2name' placeholder='Preset 2 name'><button class='secondary' onclick='presetSave(2)'>Save P2</button><button class='secondary' onclick='presetLoad(2)'>Load P2</button></div>");
   h += F("<div class='row'><input id='p3name' placeholder='Preset 3 name'><button class='secondary' onclick='presetSave(3)'>Save P3</button><button class='secondary' onclick='presetLoad(3)'>Load P3</button></div></div>");
-  h += F("<div id='diagPanel' class='card diag advanced'><div class='status' id='diagText'>Diagnostics...</div></div>");
+  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
   h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
@@ -1406,6 +1437,8 @@ String htmlPage() {
   h += F("async function zeroPosition(){const r=await fetch('/indexer/zero',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function presetSave(slot){const n=(document.getElementById('p'+slot+'name')||{}).value||('Preset '+slot);const p=new URLSearchParams({slot:String(slot),name:n});const r=await fetch('/preset/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function presetLoad(slot){const r=await fetch('/preset/load?slot='+slot,{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function diagResetIsd(){const r=await fetch('/diag/reset_isd',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function diagBridgeMode(mode){const r=await fetch('/diag/bridge_mode?mode='+encodeURIComponent(mode),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
   h += F("function onMoveUnitChanged(){const u=document.getElementById('moveUnit').value;const lbl=document.getElementById('moveLabel');const m=document.getElementById('moveAmount');");
   h += F("if(lbl){lbl.innerText=(u==='degrees')?'Step Degrees':'Total Gears';}if(m){m.min=(u==='degrees')?'0.001':'1';m.step=(u==='degrees')?'0.001':'1';}}");
@@ -1439,7 +1472,7 @@ String htmlPage() {
   h += F("document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';");
   h += F("document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';");
   h += F("document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nCommanded ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nErr ${j.positionError} steps`;");
-  h += F("const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nBacklash: ${j.backlash} steps\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}");
+  h += F("const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nBacklash: ${j.backlash} steps\\nBridgeTest: ${j.diagBridgeMode}\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}");
   h += F("renderDial(j.indexerDeg);updateDialContext(j);}");
   h += F("setInterval(refresh,1000);refresh();");
   h += F("</script></body></html>");
@@ -1485,6 +1518,7 @@ void sendJsonStatus() {
   json += "\"isrHz\":" + String(diagIsrTicksPerSec) + ",";
   json += "\"stepHz\":" + String(diagStepRatePerSec) + ",";
   json += "\"missedEst\":" + String(missedStepEstimate) + ",";
+  json += "\"diagBridgeMode\":\"" + String(diagBridgeMode == DiagBridgeMode::M3On ? "m3" : (diagBridgeMode == DiagBridgeMode::M4On ? "m4" : "off")) + "\",";
   json += "\"lastFault\":\"" + jsonEscape(lastFault) + "\",";
   json += "\"p1\":\"" + jsonEscape(presets[0].name) + "\",";
   json += "\"p2\":\"" + jsonEscape(presets[1].name) + "\",";
@@ -1897,6 +1931,64 @@ void handleSaveNetworkConfig() {
   ESP.restart();
 }
 
+void handleDiagResetIsd() {
+  // ISD latch clear per datasheet: IN1/IN2 Low for >=1.5 ms, then reassert High.
+  noInterrupts();
+  timerMotionActive = false;
+  outputCommand = OUTPUT_CMD_NONE;
+  interrupts();
+
+  writeStepperOutputs(false, false, false, false);
+  delay(2);
+
+  if (diagBridgeMode == DiagBridgeMode::Off) {
+    hardEnableStepperPins();
+    noInterrupts();
+    outputCommand = OUTPUT_CMD_HOLD_PHASE;
+    interrupts();
+  } else {
+    applyDiagBridgeModeOutput();
+  }
+
+  lastFault = "NONE";
+  Serial.println("[DIAG] ISD reset sequence applied");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleDiagBridgeMode() {
+  if (!server.hasArg("mode")) {
+    server.send(400, "text/plain", "Missing mode");
+    return;
+  }
+  String mode = server.arg("mode");
+  if (mode == "m3") {
+    diagBridgeMode = DiagBridgeMode::M3On;
+  } else if (mode == "m4") {
+    diagBridgeMode = DiagBridgeMode::M4On;
+  } else if (mode == "off") {
+    diagBridgeMode = DiagBridgeMode::Off;
+  } else {
+    server.send(400, "text/plain", "mode must be off|m3|m4");
+    return;
+  }
+
+  noInterrupts();
+  timerMotionActive = false;
+  outputCommand = OUTPUT_CMD_NONE;
+  interrupts();
+
+  if (diagBridgeMode == DiagBridgeMode::Off) {
+    hardDisableStepperPins();
+    Serial.println("[DIAG] bridge test OFF");
+  } else {
+    applyDiagBridgeModeOutput();
+    Serial.print("[DIAG] bridge test mode=");
+    Serial.println(diagBridgeMode == DiagBridgeMode::M3On ? "M3_ON" : "M4_ON");
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
 void setupWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
@@ -1915,6 +2007,8 @@ void setupWeb() {
   server.on("/preset/load", HTTP_POST, handlePresetLoad);
   server.on("/move/config", HTTP_POST, handleMoveConfig);
   server.on("/config/network", HTTP_POST, handleSaveNetworkConfig);
+  server.on("/diag/reset_isd", HTTP_POST, handleDiagResetIsd);
+  server.on("/diag/bridge_mode", HTTP_POST, handleDiagBridgeMode);
   server.begin();
 }
 
@@ -2299,17 +2393,37 @@ void setup() {
   timerStepIntervalUs = stepIntervalUs;
   timerStepIntervalRequestUs = stepIntervalUs;
   timerStepIntervalDirty = false;
-  hardDisableStepperPins();
   recalcIndexerTicks();
 
-  stepperTimer = timerBegin(0, STEPPER_TIMER_DIVIDER, true);
-  if (stepperTimer != nullptr) {
-    timerAttachInterrupt(stepperTimer, &onStepperTimerISR, false);
-    timerAlarmWrite(stepperTimer, timerTicksFromUs(STEPPER_TIMER_IDLE_US), true);
-    timerAlarmEnable(stepperTimer);
-    Serial.println("[STEP] hardware timer ISR started");
+  if (HBRIDGE_DC_TEST_MODE) {
+    noInterrupts();
+    timerMotionActive = false;
+    outputCommand = OUTPUT_CMD_NONE;
+    interrupts();
+    forceBothHBridgesOn();
+    Serial.println("[HBRIDGE_TEST] ACTIVE: both bridges forced ON (A+, B+)");
   } else {
-    Serial.println("[STEP] failed to create hardware timer");
+    hardDisableStepperPins();
+
+    stepperTimer = nullptr;
+    stepperTimerIndex = -1;
+    for (int t = 0; t < 4 && stepperTimer == nullptr; t++) {
+      stepperTimer = timerBegin(t, STEPPER_TIMER_DIVIDER, true);
+      if (stepperTimer != nullptr) {
+        stepperTimerIndex = t;
+        break;
+      }
+    }
+    if (stepperTimer != nullptr) {
+      timerAttachInterrupt(stepperTimer, &onStepperTimerISR, false);
+      timerAlarmWrite(stepperTimer, timerTicksFromUs(STEPPER_TIMER_IDLE_US), true);
+      timerAlarmEnable(stepperTimer);
+      Serial.print("[STEP] hardware timer ISR started on timer ");
+      Serial.println(stepperTimerIndex);
+    } else {
+      lastFault = "TIMER_INIT_FAIL";
+      Serial.println("[STEP] failed to create any hardware timer (0..3)");
+    }
   }
 
   // Always clear the RGB chain at boot so stale/latching LED state is reset.
@@ -2334,6 +2448,21 @@ void loop() {
   static uint32_t prevIsrTicks = 0;
   static uint32_t prevIsrSteps = 0;
   static unsigned long lastDiagMs = 0;
+
+  if (HBRIDGE_DC_TEST_MODE || diagBridgeMode != DiagBridgeMode::Off) {
+    noInterrupts();
+    timerMotionActive = false;
+    outputCommand = OUTPUT_CMD_NONE;
+    interrupts();
+    if (diagBridgeMode != DiagBridgeMode::Off) {
+      applyDiagBridgeModeOutput();
+    }
+    server.handleClient();
+    readButtons();
+    updateDisplay();
+    return;
+  }
+
   bool moving = stepperEnabled && (stepperPosition != targetPosition);
 
   if (millis() - lastDiagMs >= 1000) {
