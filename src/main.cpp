@@ -206,7 +206,6 @@ void beginOledSetupWizard();
 void handleSetupWizardButtons(bool b1Edge, bool b3Edge, bool b4Edge);
 void syncDegreeIdealToPosition(long pos);
 long computeDegreeModeTarget(long currentPos, int dir, float amount);
-void normalizeStepFrameIfIdle();
 
 long modPositive(long value, long mod) {
   long out = value % mod;
@@ -223,36 +222,6 @@ double wrapStepsToRevolution(double steps) {
     wrapped += rev;
   }
   return wrapped;
-}
-
-long floorDiv(long value, long divisor) {
-  long q = value / divisor;
-  long r = value % divisor;
-  if (r != 0 && ((r > 0) != (divisor > 0))) {
-    q -= 1;
-  }
-  return q;
-}
-
-void normalizeStepFrameIfIdle() {
-  noInterrupts();
-  long pos = stepperPosition;
-  long tgt = targetPosition;
-  if (pos != tgt) {
-    interrupts();
-    return;
-  }
-  long rev = STEPS_PER_INDEXER_REV;
-  long wraps = floorDiv(pos, rev);
-  long offset = wraps * rev;
-  if (offset != 0) {
-    stepperPosition -= offset;
-    targetPosition -= offset;
-    commandedStepsFromZero -= static_cast<double>(offset);
-    pos = stepperPosition;
-  }
-  interrupts();
-  syncDegreeIdealToPosition(pos);
 }
 
 void syncDegreeIdealToPosition(long pos) {
@@ -1544,7 +1513,6 @@ void handleStepperStop() {
 
 void handleStepperMove() {
   Serial.println("[HTTP] /stepper/move");
-  normalizeStepFrameIfIdle();
   if (!stepperEnabled) {
     Serial.println("[STEP] move rejected: disabled");
     server.send(409, "text/plain", "Stepper is disabled");
@@ -1576,13 +1544,12 @@ void handleStepperMove() {
   setTargetAndCommandedAtomic(nextTarget);
   degreeIdealSynced = false;
   Serial.print("[STEP] move target=");
-  Serial.println(nextTarget);
+  Serial.println(modPositive(nextTarget, STEPS_PER_INDEXER_REV));
   server.send(200, "text/plain", "OK");
 }
 
 void handleStepperSingleStep() {
   Serial.println("[HTTP] /stepper/single");
-  normalizeStepFrameIfIdle();
   if (!stepperEnabled) {
     Serial.println("[STEP] single step rejected: disabled");
     server.send(409, "text/plain", "Stepper is disabled");
@@ -1600,7 +1567,7 @@ void handleStepperSingleStep() {
   Serial.print("[STEP] single queued dir=");
   Serial.print(dir);
   Serial.print(" target=");
-  Serial.println(nextTarget);
+  Serial.println(modPositive(nextTarget, STEPS_PER_INDEXER_REV));
   server.send(200, "text/plain", "OK");
 }
 
@@ -1648,7 +1615,6 @@ void handleStepperAccel() {
 
 void handleIndexerStep() {
   Serial.println("[HTTP] /indexer/step");
-  normalizeStepFrameIfIdle();
   if (!stepperEnabled) {
     Serial.println("[STEP] index step rejected: disabled");
     server.send(409, "text/plain", "Stepper is disabled");
@@ -1673,7 +1639,7 @@ void handleIndexerStep() {
   Serial.print(" amount=");
   Serial.print(uiMoveAmount, 3);
   Serial.print(" target=");
-  Serial.println(nextTarget);
+  Serial.println(modPositive(nextTarget, STEPS_PER_INDEXER_REV));
   server.send(200, "text/plain", "OK");
 }
 
@@ -2174,7 +2140,6 @@ void handleButtonActions() {
 
   // B4: next (keeps original physical behavior)
   if (b4Edge) {
-    normalizeStepFrameIfIdle();
     long currentPos = getStepperPositionAtomic();
     if (stepperOutputsReleased) {
       hardEnableStepperPins();
@@ -2189,11 +2154,10 @@ void handleButtonActions() {
     Serial.print("[BTN] B4 action: next ");
     Serial.print(uiMoveAmount, 3);
     Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
-    Serial.println(targetPosition);
+    Serial.println(modPositive(getTargetPositionAtomic(), STEPS_PER_INDEXER_REV));
   }
   // B1: previous (keeps original physical behavior)
   if (b1Edge) {
-    normalizeStepFrameIfIdle();
     long currentPos = getStepperPositionAtomic();
     if (stepperOutputsReleased) {
       hardEnableStepperPins();
@@ -2208,7 +2172,7 @@ void handleButtonActions() {
     Serial.print("[BTN] B1 action: previous ");
     Serial.print(uiMoveAmount, 3);
     Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
-    Serial.println(targetPosition);
+    Serial.println(modPositive(getTargetPositionAtomic(), STEPS_PER_INDEXER_REV));
   }
 
   lastActionB1 = button1Pressed;
