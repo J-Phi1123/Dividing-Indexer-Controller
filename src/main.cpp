@@ -56,9 +56,11 @@ constexpr uint8_t STEPPER_IN3 = 15;
 constexpr uint8_t STEPPER_IN4 = 14;
 #endif
 
-// Button inputs (choose pins suitable for your wiring)
-constexpr uint8_t BTN1_PIN = 32;
-constexpr uint8_t BTN2_PIN = 33;
+// Physical button inputs, labeled left-to-right on PCB as B1, B2, B3, B4.
+constexpr uint8_t BTN1_PIN = 26;  // Left-most
+constexpr uint8_t BTN2_PIN = 25;
+constexpr uint8_t BTN3_PIN = 33;
+constexpr uint8_t BTN4_PIN = 32;  // Right-most
 
 // OLED I2C pins
 constexpr uint8_t I2C_SDA_PIN = 21;
@@ -68,6 +70,7 @@ constexpr int OLED_W = 128;
 constexpr int OLED_H = 64;
 constexpr uint8_t RGB_LED_PIN = 16;
 constexpr uint8_t RGB_LED_COUNT = 4;
+constexpr bool USE_STATUS_LED = false;
 
 WebServer server(80);
 Preferences prefs;
@@ -78,6 +81,8 @@ Adafruit_NeoPixel rgbLeds(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 // Runtime state
 volatile bool button1Pressed = false;
 volatile bool button2Pressed = false;
+volatile bool button3Pressed = false;
+volatile bool button4Pressed = false;
 volatile bool stepperEnabled = true;
 bool stepperOutputsReleased = false;
 volatile long stepperPosition = 0;
@@ -100,6 +105,8 @@ constexpr uint16_t TB_STANDBY_WAKE_US = 30;
 constexpr uint16_t REVERSAL_DWELL_US = 1;
 constexpr float START_SPEED_STEPS_PER_SEC = 5.0f;
 constexpr float MAX_RAMP_DT_SEC = 0.02f;
+constexpr bool USE_HIGH_TORQUE_MODE = false;
+constexpr float HIGH_TORQUE_SPEED_THRESHOLD_STEPS_PER_SEC = 2500.0f;
 constexpr uint32_t MIN_STEP_INTERVAL_US = 50;  // 20,000 steps/s theoretical limit
 constexpr uint32_t STEPPER_TIMER_IDLE_US = 1000;
 constexpr uint16_t STEPPER_TIMER_DIVIDER = 40;  // 80MHz/40 = 2MHz timer clock
@@ -114,12 +121,17 @@ constexpr int8_t OUTPUT_CMD_NONE = 0;
 constexpr int8_t OUTPUT_CMD_STOP = 1;
 constexpr int8_t OUTPUT_CMD_HOLD_PHASE = 2;
 volatile int8_t outputCommand = OUTPUT_CMD_NONE;
+volatile bool highTorqueModeActive = false;
 
 // Debounce state
 bool lastBtn1Read = HIGH;
 bool lastBtn2Read = HIGH;
+bool lastBtn3Read = HIGH;
+bool lastBtn4Read = HIGH;
 unsigned long lastBtn1EdgeMs = 0;
 unsigned long lastBtn2EdgeMs = 0;
+unsigned long lastBtn3EdgeMs = 0;
+unsigned long lastBtn4EdgeMs = 0;
 constexpr unsigned long DEBOUNCE_MS = 30;
 
 String wifiMode = "STA";
@@ -142,13 +154,42 @@ NetworkConfig savedConfig;
 enum class MoveUnit : uint8_t { Gears = 0, Degrees = 1 };
 MoveUnit uiMoveUnit = MoveUnit::Gears;
 float uiMoveAmount = 1.0f;
+float degreeStepSetting = 10.0f;
 double commandedStepsFromZero = 0.0;
+double degreeIdealPosSteps = 0.0;
+bool degreeIdealSynced = false;
+long backlashSteps = 0;
+int lastCommandDir = 0;
+String lastFault = "NONE";
+volatile uint32_t isrTickCounter = 0;
+volatile uint32_t isrStepCounter = 0;
+uint32_t diagIsrTicksPerSec = 0;
+uint32_t diagStepRatePerSec = 0;
+long missedStepEstimate = 0;
+enum class OledPage : uint8_t { Status = 0, Motion = 1, Diag = 2, Setup = 3 };
+OledPage oledPage = OledPage::Status;
+enum class SetupStage : uint8_t { Zero = 0, Mode = 1, Value = 2 };
+SetupStage setupStage = SetupStage::Zero;
+MoveUnit setupMoveUnit = MoveUnit::Gears;
+int setupGearsValue = 10;
+float setupDegreeValue = 10.0f;
+
+struct MotionPreset {
+  String name;
+  int gears;
+  float degreeStep;
+  float speed;
+  float accel;
+};
+MotionPreset presets[3];
 
 // Forward declarations for helper functions used before their definitions.
 void hardDisableStepperPins();
 void hardEnableStepperPins();
 void applyStepperSpeed();
 void setStepperPhase(int phase);
+uint32_t computeTimerIntervalUsForSpeed(float speed, bool highTorqueMode);
+void renderOledStatus();
 void showMovingScreen();
 void IRAM_ATTR onStepperTimerISR();
 void IRAM_ATTR writeStepperOutputs(bool in1, bool in2, bool in3, bool in4);
@@ -156,6 +197,98 @@ bool initDisplayWithI2cPins(uint8_t sdaPin, uint8_t sclPin);
 long getStepperPositionAtomic();
 long getTargetPositionAtomic();
 void setTargetAndCommandedAtomic(long value);
+long applyBacklashCompensation(long currentPos, long nextTarget);
+void loadControlSettings();
+void saveControlSettings();
+void loadPresets();
+void savePresetSlot(int slot);
+void beginOledSetupWizard();
+void handleSetupWizardButtons(bool b1Edge, bool b3Edge, bool b4Edge);
+void syncDegreeIdealToPosition(long pos);
+long computeDegreeModeTarget(long currentPos, int dir, float amount);
+void normalizeStepFrameIfIdle();
+
+long modPositive(long value, long mod) {
+  long out = value % mod;
+  if (out < 0) {
+    out += mod;
+  }
+  return out;
+}
+
+double wrapStepsToRevolution(double steps) {
+  const double rev = static_cast<double>(STEPS_PER_INDEXER_REV);
+  double wrapped = std::fmod(steps, rev);
+  if (wrapped < 0.0) {
+    wrapped += rev;
+  }
+  return wrapped;
+}
+
+long floorDiv(long value, long divisor) {
+  long q = value / divisor;
+  long r = value % divisor;
+  if (r != 0 && ((r > 0) != (divisor > 0))) {
+    q -= 1;
+  }
+  return q;
+}
+
+void normalizeStepFrameIfIdle() {
+  noInterrupts();
+  long pos = stepperPosition;
+  long tgt = targetPosition;
+  if (pos != tgt) {
+    interrupts();
+    return;
+  }
+  long rev = STEPS_PER_INDEXER_REV;
+  long wraps = floorDiv(pos, rev);
+  long offset = wraps * rev;
+  if (offset != 0) {
+    stepperPosition -= offset;
+    targetPosition -= offset;
+    commandedStepsFromZero -= static_cast<double>(offset);
+    pos = stepperPosition;
+  }
+  interrupts();
+  syncDegreeIdealToPosition(pos);
+}
+
+void syncDegreeIdealToPosition(long pos) {
+  degreeIdealPosSteps = static_cast<double>(modPositive(pos, STEPS_PER_INDEXER_REV));
+  degreeIdealSynced = true;
+}
+
+long computeDegreeModeTarget(long currentPos, int dir, float amount) {
+  if (!degreeIdealSynced) {
+    syncDegreeIdealToPosition(currentPos);
+  }
+
+  const double stepSpan = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) / 360.0;
+  if (stepSpan < 0.000001) {
+    return currentPos;
+  }
+
+  degreeIdealPosSteps += (dir > 0) ? stepSpan : -stepSpan;
+  degreeIdealPosSteps = wrapStepsToRevolution(degreeIdealPosSteps);
+
+  long idealStep = lround(degreeIdealPosSteps);
+  if (idealStep >= STEPS_PER_INDEXER_REV) {
+    idealStep = 0;
+  } else if (idealStep < 0) {
+    idealStep = 0;
+  }
+
+  long currentMod = modPositive(currentPos, STEPS_PER_INDEXER_REV);
+  long delta = idealStep - currentMod;
+  if (dir > 0 && delta <= 0) {
+    delta += STEPS_PER_INDEXER_REV;
+  } else if (dir < 0 && delta >= 0) {
+    delta -= STEPS_PER_INDEXER_REV;
+  }
+  return currentPos + delta;
+}
 
 long computeIndexedAbsoluteTargetFromCurrent(long currentPos, int dir, MoveUnit unit, float amount) {
   if (dir == 0) {
@@ -170,28 +303,21 @@ long computeIndexedAbsoluteTargetFromCurrent(long currentPos, int dir, MoveUnit 
 
   double stepSpan = 0.0;
   if (unit == MoveUnit::Degrees) {
-    stepSpan = (static_cast<double>(STEPS_PER_INDEXER_REV) * static_cast<double>(amount)) / 360.0;
-    if (stepSpan < 0.000001) {
-      return currentPos;
-    }
-    long delta = lround(stepSpan);
-    if (delta < 1) {
-      delta = 1;
-    }
-    return currentPos + ((dir > 0) ? delta : -delta);
+    return computeDegreeModeTarget(currentPos, dir, amount);
   } else {
+    degreeIdealSynced = false;
     if (numberOfGears < 1) {
       return currentPos;
     }
-    // Gear mode is always one gear per click (+1 Gear / -1 Gear).
+    // Gear mode is always one gear per click (+1 Gear / -1 Gear), computed on wrapped position.
     stepSpan = static_cast<double>(STEPS_PER_INDEXER_REV) / static_cast<double>(numberOfGears);
   }
   if (stepSpan < 0.000001) {
     return currentPos;
   }
 
-  const double pos = static_cast<double>(currentPos);
-  const double q = pos / stepSpan;
+  const long currentMod = modPositive(currentPos, STEPS_PER_INDEXER_REV);
+  const double q = static_cast<double>(currentMod) / stepSpan;
   const double eps = 1e-9;
   double index = 0.0;
   if (dir > 0) {
@@ -199,15 +325,15 @@ long computeIndexedAbsoluteTargetFromCurrent(long currentPos, int dir, MoveUnit 
   } else {
     index = std::ceil(q - eps) - 1.0;
   }
-  long absTarget = lround(index * stepSpan);
-  if (absTarget == currentPos) {
-    long minDelta = lround(stepSpan);
-    if (minDelta < 1) {
-      minDelta = 1;
-    }
-    absTarget = currentPos + ((dir > 0) ? minDelta : -minDelta);
+  long targetMod = lround(index * stepSpan);
+  targetMod = modPositive(targetMod, STEPS_PER_INDEXER_REV);
+  long delta = targetMod - currentMod;
+  if (dir > 0 && delta <= 0) {
+    delta += STEPS_PER_INDEXER_REV;
+  } else if (dir < 0 && delta >= 0) {
+    delta -= STEPS_PER_INDEXER_REV;
   }
-  return absTarget;
+  return currentPos + delta;
 }
 
 inline uint64_t timerTicksFromUs(uint32_t us) {
@@ -243,6 +369,90 @@ void setTargetAndCommandedAtomic(long value) {
   interrupts();
 }
 
+long applyBacklashCompensation(long currentPos, long nextTarget) {
+  int dir = 0;
+  if (nextTarget > currentPos) dir = 1;
+  if (nextTarget < currentPos) dir = -1;
+  if (dir != 0 && lastCommandDir != 0 && dir != lastCommandDir && backlashSteps > 0) {
+    nextTarget += static_cast<long>(dir) * backlashSteps;
+  }
+  if (dir != 0) {
+    lastCommandDir = dir;
+  }
+  return nextTarget;
+}
+
+void loadControlSettings() {
+  prefs.begin("ctrlcfg", true);
+  backlashSteps = prefs.getLong("backlash", 0);
+  degreeStepSetting = prefs.getFloat("deg_step", 10.0f);
+  prefs.end();
+  if (backlashSteps < 0) backlashSteps = 0;
+  if (degreeStepSetting <= 0.0f) degreeStepSetting = 10.0f;
+}
+
+void saveControlSettings() {
+  prefs.begin("ctrlcfg", false);
+  prefs.putLong("backlash", backlashSteps);
+  prefs.putFloat("deg_step", degreeStepSetting);
+  prefs.end();
+}
+
+void loadPresets() {
+  for (int i = 0; i < 3; i++) {
+    presets[i].name = "Preset " + String(i + 1);
+    presets[i].gears = numberOfGears;
+    presets[i].degreeStep = degreeStepSetting;
+    presets[i].speed = speedStepsPerSec;
+    presets[i].accel = accelStepsPerSec2;
+  }
+
+  prefs.begin("presets", true);
+  for (int i = 0; i < 3; i++) {
+    String key = "p" + String(i + 1);
+    String raw = prefs.getString(key.c_str(), "");
+    if (raw.length() == 0) {
+      continue;
+    }
+    int a = raw.indexOf('|');
+    int b = raw.indexOf('|', a + 1);
+    int c = raw.indexOf('|', b + 1);
+    int d = raw.indexOf('|', c + 1);
+    if (a < 0 || b < 0 || c < 0 || d < 0) {
+      continue;
+    }
+    presets[i].name = raw.substring(0, a);
+    presets[i].gears = raw.substring(a + 1, b).toInt();
+    presets[i].degreeStep = raw.substring(b + 1, c).toFloat();
+    presets[i].speed = raw.substring(c + 1, d).toFloat();
+    int e = raw.indexOf('|', d + 1);
+    if (e >= 0) {
+      // Backward compatibility: ignore legacy trailing motor-current field.
+      presets[i].accel = raw.substring(d + 1, e).toFloat();
+    } else {
+      presets[i].accel = raw.substring(d + 1).toFloat();
+    }
+    if (presets[i].gears < 1) presets[i].gears = 1;
+    if (presets[i].degreeStep <= 0.0f) presets[i].degreeStep = 10.0f;
+    if (presets[i].speed < 5.0f) presets[i].speed = 5.0f;
+    if (presets[i].accel < 5.0f) presets[i].accel = 5.0f;
+  }
+  prefs.end();
+}
+
+void savePresetSlot(int slot) {
+  if (slot < 0 || slot >= 3) {
+    return;
+  }
+  String raw = presets[slot].name + "|" + String(presets[slot].gears) + "|" +
+               String(presets[slot].degreeStep, 3) + "|" + String(presets[slot].speed, 1) +
+               "|" + String(presets[slot].accel, 1);
+  prefs.begin("presets", false);
+  String key = "p" + String(slot + 1);
+  prefs.putString(key.c_str(), raw);
+  prefs.end();
+}
+
 float getIndexerDegrees() {
   long modPos = stepperPosition % STEPS_PER_INDEXER_REV;
   if (modPos < 0) {
@@ -268,32 +478,171 @@ int getCurrentGearFromPosition(long pos) {
   return currentGear;
 }
 
+void beginOledSetupWizard() {
+  setupStage = SetupStage::Zero;
+  setupMoveUnit = uiMoveUnit;
+  setupGearsValue = numberOfGears;
+  if (setupGearsValue < 1) {
+    setupGearsValue = 1;
+  }
+  setupDegreeValue = degreeStepSetting;
+  if (setupDegreeValue <= 0.0f) {
+    setupDegreeValue = 10.0f;
+  }
+}
+
+void handleSetupWizardButtons(bool b1Edge, bool b3Edge, bool b4Edge) {
+  if (setupStage == SetupStage::Zero) {
+    if (b1Edge) {
+      noInterrupts();
+      stepperPosition = 0;
+      targetPosition = 0;
+      commandedStepsFromZero = 0.0;
+      timerMotionActive = false;
+      lastCommandDir = 0;
+      interrupts();
+      syncDegreeIdealToPosition(0);
+      Serial.println("[SETUP] zeroed index reference");
+      renderOledStatus();
+    }
+    if (b3Edge) {
+      setupStage = SetupStage::Mode;
+      Serial.println("[SETUP] stage=MODE");
+      renderOledStatus();
+    }
+    return;
+  }
+
+  if (setupStage == SetupStage::Mode) {
+    if (b1Edge || b4Edge) {
+      setupMoveUnit = (setupMoveUnit == MoveUnit::Degrees) ? MoveUnit::Gears : MoveUnit::Degrees;
+      Serial.print("[SETUP] mode=");
+      Serial.println(setupMoveUnit == MoveUnit::Degrees ? "degrees" : "gears");
+      renderOledStatus();
+    }
+    if (b3Edge) {
+      setupStage = SetupStage::Value;
+      Serial.println("[SETUP] stage=VALUE");
+      renderOledStatus();
+    }
+    return;
+  }
+
+  if (setupMoveUnit == MoveUnit::Degrees) {
+    if (b1Edge) {
+      setupDegreeValue += 0.5f;
+      if (setupDegreeValue > 360.0f) setupDegreeValue = 360.0f;
+      renderOledStatus();
+    }
+    if (b4Edge) {
+      setupDegreeValue -= 0.5f;
+      if (setupDegreeValue < 0.001f) setupDegreeValue = 0.001f;
+      renderOledStatus();
+    }
+    if (b3Edge) {
+      uiMoveUnit = MoveUnit::Degrees;
+      degreeStepSetting = setupDegreeValue;
+      uiMoveAmount = degreeStepSetting;
+      syncDegreeIdealToPosition(getStepperPositionAtomic());
+      saveControlSettings();
+      Serial.print("[SETUP] applied degrees=");
+      Serial.println(degreeStepSetting, 3);
+      setupStage = SetupStage::Zero;
+      renderOledStatus();
+    }
+  } else {
+    if (b1Edge) {
+      setupGearsValue++;
+      if (setupGearsValue > 360) setupGearsValue = 360;
+      renderOledStatus();
+    }
+    if (b4Edge) {
+      setupGearsValue--;
+      if (setupGearsValue < 1) setupGearsValue = 1;
+      renderOledStatus();
+    }
+    if (b3Edge) {
+      uiMoveUnit = MoveUnit::Gears;
+      numberOfGears = setupGearsValue;
+      recalcIndexerTicks();
+      uiMoveAmount = 1.0f;
+      degreeIdealSynced = false;
+      Serial.print("[SETUP] applied gears=");
+      Serial.println(numberOfGears);
+      setupStage = SetupStage::Zero;
+      renderOledStatus();
+    }
+  }
+}
+
 void renderOledStatus() {
   if (!oledReady) {
     return;
   }
 
   const long pos = getStepperPositionAtomic();
-  const float curDeg = getIndexerDegrees();
-  String lineCur;
-
-  if (uiMoveUnit == MoveUnit::Degrees) {
-    lineCur = "Cur " + String(curDeg, 2) + " deg";
-  } else {
-    const int curGear = getCurrentGearFromPosition(pos);
-    lineCur = "Cur G " + String(curGear) + "/" + String(numberOfGears);
-  }
-
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  // Use a larger GFX font (~1.5x vs default) for IP + current status.
-  display.setFont(&FreeSans9pt7b);
-  display.setCursor(0, 14);
-  display.print(ipAddr.toString());
-  display.setCursor(0, 32);
-  display.print(lineCur);
-  display.setFont(nullptr);
+
+  if (oledPage == OledPage::Status) {
+    String lineCur;
+    const float curDeg = getIndexerDegrees();
+    if (uiMoveUnit == MoveUnit::Degrees) {
+      lineCur = "Cur " + String(curDeg, 2) + " deg";
+    } else {
+      const int curGear = getCurrentGearFromPosition(pos);
+      lineCur = "Cur G " + String(curGear) + "/" + String(numberOfGears);
+    }
+    display.setFont(&FreeSans9pt7b);
+    display.setCursor(0, 14);
+    display.print(ipAddr.toString());
+    display.setCursor(0, 32);
+    display.print(lineCur);
+    display.setFont(nullptr);
+  } else if (oledPage == OledPage::Motion) {
+    display.setCursor(0, 0);
+    display.println("Motion");
+    display.print("Spd:");
+    display.println(speedStepsPerSec, 0);
+    display.print("Acc:");
+    display.println(accelStepsPerSec2, 0);
+    display.print("Backlash:");
+    display.println(backlashSteps);
+  } else if (oledPage == OledPage::Diag) {
+    display.setCursor(0, 0);
+    display.println("Diag");
+    display.print("ISR:");
+    display.println(diagIsrTicksPerSec);
+    display.print("StepHz:");
+    display.println(diagStepRatePerSec);
+    display.print("Fault:");
+    display.println(lastFault);
+  } else {
+    display.setCursor(0, 0);
+    if (setupStage == SetupStage::Zero) {
+      display.println("Setup 1/3 Zero");
+      display.println("B4: Zero Index");
+      display.println("B2: Next");
+    } else if (setupStage == SetupStage::Mode) {
+      display.println("Setup 2/3 Mode");
+      display.print("Mode: ");
+      display.println(setupMoveUnit == MoveUnit::Degrees ? "Degree" : "Gear");
+      display.println("B4/B1: Toggle");
+      display.println("B2: Next");
+    } else {
+      display.println("Setup 3/3 Value");
+      if (setupMoveUnit == MoveUnit::Degrees) {
+        display.print("Deg: ");
+        display.println(setupDegreeValue, 3);
+      } else {
+        display.print("Gears: ");
+        display.println(setupGearsValue);
+      }
+      display.println("B4:+  B1:-");
+      display.println("B2: Apply");
+    }
+  }
   display.display();
 }
 
@@ -301,16 +650,30 @@ void applyStepperSpeed() {
   if (speedStepsPerSec < START_SPEED_STEPS_PER_SEC) {
     speedStepsPerSec = START_SPEED_STEPS_PER_SEC;
   }
-  stepIntervalUs = static_cast<uint32_t>(1000000.0f / speedStepsPerSec);
-  if (stepIntervalUs < MIN_STEP_INTERVAL_US) {
-    stepIntervalUs = MIN_STEP_INTERVAL_US;
+  stepIntervalUs = computeTimerIntervalUsForSpeed(speedStepsPerSec, false);
+}
+
+uint32_t computeTimerIntervalUsForSpeed(float speed, bool highTorqueMode) {
+  if (speed < START_SPEED_STEPS_PER_SEC) {
+    speed = START_SPEED_STEPS_PER_SEC;
   }
+  float commutationsPerSec = speed;
+  if (highTorqueMode) {
+    // Full-step torque mode advances 2 logical half-steps per commutation.
+    commutationsPerSec *= 0.5f;
+  }
+  uint32_t intervalUs = static_cast<uint32_t>(1000000.0f / commutationsPerSec);
+  if (intervalUs < MIN_STEP_INTERVAL_US) {
+    intervalUs = MIN_STEP_INTERVAL_US;
+  }
+  return intervalUs;
 }
 
 void runStepperToTargetOneStep() {
   if (!stepperEnabled) {
     timerMotionActive = false;
     currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+    highTorqueModeActive = false;
     if (timerStepIntervalUs != STEPPER_TIMER_IDLE_US) {
       timerStepIntervalRequestUs = STEPPER_TIMER_IDLE_US;
       timerStepIntervalDirty = true;
@@ -319,6 +682,7 @@ void runStepperToTargetOneStep() {
   }
   if (stepperPosition == targetPosition) {
     currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+    highTorqueModeActive = false;
     lastRampUs = micros();
     timerMotionActive = false;
     if (timerStepIntervalUs != STEPPER_TIMER_IDLE_US) {
@@ -354,7 +718,6 @@ void runStepperToTargetOneStep() {
   if (desiredSpeed < START_SPEED_STEPS_PER_SEC) {
     desiredSpeed = START_SPEED_STEPS_PER_SEC;
   }
-
   float dv = accelStepsPerSec2 * dt;
   if (currentSpeedStepsPerSec < desiredSpeed) {
     currentSpeedStepsPerSec += dv;
@@ -365,11 +728,11 @@ void runStepperToTargetOneStep() {
   if (currentSpeedStepsPerSec < START_SPEED_STEPS_PER_SEC) {
     currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
   }
+  bool enableHighTorque =
+      USE_HIGH_TORQUE_MODE && (currentSpeedStepsPerSec >= HIGH_TORQUE_SPEED_THRESHOLD_STEPS_PER_SEC);
+  highTorqueModeActive = enableHighTorque;
 
-  uint32_t dynIntervalUs = static_cast<uint32_t>(1000000.0f / currentSpeedStepsPerSec);
-  if (dynIntervalUs < MIN_STEP_INTERVAL_US) {
-    dynIntervalUs = MIN_STEP_INTERVAL_US;
-  }
+  uint32_t dynIntervalUs = computeTimerIntervalUsForSpeed(currentSpeedStepsPerSec, enableHighTorque);
   if (dynIntervalUs != timerStepIntervalUs) {
     timerStepIntervalRequestUs = dynIntervalUs;
     timerStepIntervalDirty = true;
@@ -433,6 +796,9 @@ const char* wifiStatusName(wl_status_t s) {
 }
 
 void setFirstLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  if (!USE_STATUS_LED) {
+    return;
+  }
   rgbLeds.setPixelColor(0, rgbLeds.Color(r, g, b));
   rgbLeds.show();
 }
@@ -508,6 +874,7 @@ void setStepperPhase(int phase) {
 }
 
 void IRAM_ATTR onStepperTimerISR() {
+  isrTickCounter++;
   if (timerStepIntervalDirty && stepperTimer != nullptr) {
     timerStepIntervalUs = timerStepIntervalRequestUs;
     timerAlarmWrite(stepperTimer, timerTicksFromUs(timerStepIntervalUs), true);
@@ -535,14 +902,21 @@ void IRAM_ATTR onStepperTimerISR() {
   }
 
   int dir = (tgt > pos) ? 1 : -1;
+  long remaining = labs(tgt - pos);
+  bool useHighTorque = USE_HIGH_TORQUE_MODE && highTorqueModeActive && remaining >= 2;
+  int stepQuantum = 1;
+  if (useHighTorque && ((phaseIndex & 1) != 0)) {
+    stepQuantum = 2;
+  }
   if (lastStepDir != 0 && dir != lastStepDir && REVERSAL_DWELL_US > 0) {
     // Apply brief blanking only on direction changes.
     writeStepperOutputs(false, false, false, false);
     ets_delay_us(REVERSAL_DWELL_US);
   }
-  phaseIndex = (phaseIndex + dir + 8) % 8;
+  phaseIndex = (phaseIndex + (dir * stepQuantum) + 8) % 8;
   setStepperPhase(phaseIndex);
-  stepperPosition = pos + dir;
+  stepperPosition = pos + (dir * stepQuantum);
+  isrStepCounter++;
   lastStepDir = dir;
 }
 
@@ -554,6 +928,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.println(IPAddress(info.got_ip.ip_info.ip.addr));
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     uint8_t reason = info.wifi_sta_disconnected.reason;
+    lastFault = "WIFI_DISCONNECT_" + String(reason);
     Serial.print("[WIFI_EVT] STA_DISCONNECTED reason=");
     Serial.print(reason);
     Serial.print(" ");
@@ -925,6 +1300,27 @@ String htmlEscape(const String& in) {
   return out;
 }
 
+String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '\\' || c == '"') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 String htmlPage() {
   String h;
   h.reserve(7600);
@@ -933,7 +1329,8 @@ String htmlPage() {
   h += F(":root{--bg1:#f4f7fb;--bg2:#e8eef8;--card:#ffffff;--ink:#1e2b3a;--muted:#5c6b7a;--line:#d9e3ef;--accent:#007f73;--accent2:#0a4f8a;}");
   h += F("*{box-sizing:border-box}body{margin:0;font-family:'Trebuchet MS','Segoe UI',sans-serif;background:linear-gradient(180deg,var(--bg1),var(--bg2));color:var(--ink)}");
   h += F(".shell{max-width:980px;margin:0 auto;padding:14px}.title{margin:6px 0 14px;font-size:clamp(1.2rem,4.8vw,2rem);letter-spacing:.02em}");
-  h += F(".topbar{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}.settings{display:none;margin-bottom:12px}");
+  h += F(".topbar{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin:0 0 10px}.settings{display:none;margin-bottom:12px}.diag{display:none;margin-bottom:12px}");
+  h += F("body.operator button,body.operator input,body.operator select{font-size:18px;padding:12px 14px}body.operator .advanced{display:none!important}");
   h += F(".grid{display:grid;grid-template-columns:1.1fr 1fr;gap:12px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px;box-shadow:0 4px 14px rgba(20,40,60,.08)}");
   h += F(".k{font-size:.82rem;color:var(--muted)}.v{font-size:1.05rem;font-weight:700}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}");
   h += F("button,input{font-size:15px;border-radius:10px;border:1px solid #c8d6e8;padding:10px 12px}button{background:#fff;cursor:pointer}button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}");
@@ -943,11 +1340,17 @@ String htmlPage() {
   h += F(".net{margin-top:8px;padding:10px;border:1px dashed #9ab2cc;border-radius:12px;background:#f8fbff}");
   h += F("@media (max-width:800px){.grid{grid-template-columns:1fr}.shell{padding:10px}button,input{flex:1}}");
   h += F("</style></head><body><div class='shell'><h1 class='title'>Divider Indexer Controller</h1>");
-  h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button></div>");
-  h += F("<div id='settingsPanel' class='card settings'><div class='row'><input id='speed' type='number' value='5500' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
+  h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button><button class='secondary' onclick='toggleDiagnostics()'>Diagnostics</button><button class='secondary' onclick='toggleOperatorMode()'>Operator Mode</button></div>");
+  h += F("<div id='settingsPanel' class='card settings advanced'><div class='row'><input id='speed' type='number' value='5500' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
   h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
-  h += F("<div class='row'><input id='setPosDeg' type='number' value='0' min='0' max='360' step='0.001'><button class='secondary' onclick='setPositionDeg()'>Set Position (deg)</button></div>");
-  h += F("<div class='row'><button class='secondary' onclick='zeroPosition()'>Zero Position</button></div></div>");
+  h += F("<div class='row'><input id='backlash' type='number' value='0' min='0' step='1' oninput='markDirty(\"backlash\")'><button class='secondary' onclick='setBacklash()'>Set Backlash (steps)</button></div>");
+  h += F("<div class='row'><input id='setPosDeg' type='number' value='0' min='0' max='360' step='0.001'><button class='secondary' onclick='setPositionDeg()'>Set Absolute Deg</button></div>");
+  h += F("<div class='row'><input id='setPosGear' type='number' value='1' min='1' step='1'><button class='secondary' onclick='setPositionGear()'>Set Absolute Gear</button></div>");
+  h += F("<div class='row'><button class='secondary' onclick='zeroPosition()'>Zero Position</button></div>");
+  h += F("<div class='row'><input id='p1name' placeholder='Preset 1 name'><button class='secondary' onclick='presetSave(1)'>Save P1</button><button class='secondary' onclick='presetLoad(1)'>Load P1</button></div>");
+  h += F("<div class='row'><input id='p2name' placeholder='Preset 2 name'><button class='secondary' onclick='presetSave(2)'>Save P2</button><button class='secondary' onclick='presetLoad(2)'>Load P2</button></div>");
+  h += F("<div class='row'><input id='p3name' placeholder='Preset 3 name'><button class='secondary' onclick='presetSave(3)'>Save P3</button><button class='secondary' onclick='presetLoad(3)'>Load P3</button></div></div>");
+  h += F("<div id='diagPanel' class='card diag advanced'><div class='status' id='diagText'>Diagnostics...</div></div>");
   h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
@@ -1022,12 +1425,18 @@ String htmlPage() {
   h += F("<script>");
   h += F("async function cmd(u){await fetch(u,{method:'POST'});refresh();}");
   h += F("function toggleSettings(){const p=document.getElementById('settingsPanel');if(!p)return;p.style.display=(p.style.display==='block')?'none':'block';}");
+  h += F("function toggleDiagnostics(){const p=document.getElementById('diagPanel');if(!p)return;p.style.display=(p.style.display==='block')?'none':'block';}");
+  h += F("function toggleOperatorMode(){document.body.classList.toggle('operator');}");
   h += F("const dirtyFields=new Set();");
   h += F("function markDirty(id){dirtyFields.add(id);}function clearDirty(id){dirtyFields.delete(id);}");
   h += F("async function setSpeed(){const s=document.getElementById('speed').value||5500;const r=await fetch('/stepper/speed?value='+s,{method:'POST'});if(r.ok)clearDirty('speed');refresh();}");
   h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;const r=await fetch('/stepper/accel?value='+a,{method:'POST'});if(r.ok)clearDirty('accel');refresh();}");
-  h += F("async function setPositionDeg(){const d=document.getElementById('setPosDeg').value||0;const r=await fetch('/indexer/set_position_deg?value='+encodeURIComponent(d),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function setBacklash(){const v=document.getElementById('backlash').value||0;const r=await fetch('/settings/backlash?value='+encodeURIComponent(v),{method:'POST'});if(r.ok)clearDirty('backlash');refresh();}");
+  h += F("async function setPositionDeg(){const d=document.getElementById('setPosDeg').value||0;if(!confirm('Set current absolute position to '+d+' degrees?'))return;const r=await fetch('/indexer/set_position_deg?value='+encodeURIComponent(d),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function setPositionGear(){const g=document.getElementById('setPosGear').value||1;if(!confirm('Set current absolute position to gear '+g+'?'))return;const r=await fetch('/indexer/set_position_gear?value='+encodeURIComponent(g),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function zeroPosition(){const r=await fetch('/indexer/zero',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function presetSave(slot){const n=(document.getElementById('p'+slot+'name')||{}).value||('Preset '+slot);const p=new URLSearchParams({slot:String(slot),name:n});const r=await fetch('/preset/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function presetLoad(slot){const r=await fetch('/preset/load?slot='+slot,{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
   h += F("function onMoveUnitChanged(){const u=document.getElementById('moveUnit').value;const lbl=document.getElementById('moveLabel');const m=document.getElementById('moveAmount');");
   h += F("if(lbl){lbl.innerText=(u==='degrees')?'Step Degrees':'Total Gears';}if(m){m.min=(u==='degrees')?'0.001':'1';m.step=(u==='degrees')?'0.001':'1';}}");
@@ -1054,13 +1463,14 @@ String htmlPage() {
   h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(!el)return;if(document.activeElement===el||dirtyFields.has(id))return;el.value=val;}");
   h += F("function updateMoveUi(j){const lbl=document.getElementById('moveLabel');if(lbl){lbl.innerText=(j.moveUnit==='degrees')?'Step Degrees':'Total Gears';}");
   h += F("const m=document.getElementById('moveAmount');if(!m)return;m.min=(j.moveUnit==='degrees')?'0.001':'1';m.step=(j.moveUnit==='degrees')?'0.001':'1';");
-  h += F("if(document.activeElement!==m&&!dirtyFields.has('moveAmount')){m.value=(j.moveUnit==='degrees')?j.moveAmount:j.gears;}}");
+  h += F("if(document.activeElement!==m&&!dirtyFields.has('moveAmount')){m.value=(j.moveUnit==='degrees')?j.degreeStep:j.gears;}}");
   h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();");
-  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);updateMoveUi(j);");
+  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('backlash',j.backlash);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);");
   h += F("const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}");
   h += F("document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';");
   h += F("document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';");
-  h += F("document.getElementById('status').innerText=`Pos ${j.position} -> ${j.target}\\nAngle ${Number(j.indexerDeg).toFixed(3)} deg\\nMode ${j.moveUnit==='degrees'?(j.moveAmount+' deg'):(''+j.gears+' gears')}`;");
+  h += F("document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nCommanded ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nErr ${j.positionError} steps`;");
+  h += F("const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nBacklash: ${j.backlash} steps\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}");
   h += F("renderDial(j.indexerDeg);updateDialContext(j);}");
   h += F("setInterval(refresh,1000);refresh();");
   h += F("</script></body></html>");
@@ -1068,23 +1478,48 @@ String htmlPage() {
 }
 
 void sendJsonStatus() {
+  long posAbs = getStepperPositionAtomic();
+  long tgtAbs = getTargetPositionAtomic();
+  long pos = modPositive(posAbs, STEPS_PER_INDEXER_REV);
+  long tgt = modPositive(tgtAbs, STEPS_PER_INDEXER_REV);
+  long cmdPos = lround(commandedStepsFromZero);
+  long absErr = labs(tgtAbs - posAbs);
+  int currentGear = getCurrentGearFromPosition(posAbs);
+  float cmdDeg = (static_cast<float>(tgt) * 360.0f) /
+                 static_cast<float>(STEPS_PER_INDEXER_REV);
+  float actualDeg = getIndexerDegrees();
   String json = "{";
   json += "\"ip\":\"" + ipAddr.toString() + "\",";
   json += "\"bootIp\":\"" + (bootIpCaptured ? bootIpAddr.toString() : String("")) + "\",";
   json += "\"wifiMode\":\"" + wifiMode + "\",";
   json += "\"enabled\":" + String(stepperEnabled ? "true" : "false") + ",";
-  json += "\"position\":" + String(stepperPosition) + ",";
-  json += "\"target\":" + String(targetPosition) + ",";
-  json += "\"indexerDeg\":" + String(getIndexerDegrees(), 3) + ",";
+  json += "\"position\":" + String(pos) + ",";
+  json += "\"target\":" + String(tgt) + ",";
+  json += "\"cmdPosition\":" + String(cmdPos) + ",";
+  json += "\"positionError\":" + String(absErr) + ",";
+  json += "\"indexerDeg\":" + String(actualDeg, 3) + ",";
+  json += "\"cmdDeg\":" + String(cmdDeg, 3) + ",";
   json += "\"gears\":" + String(numberOfGears) + ",";
+  json += "\"currentGear\":" + String(currentGear) + ",";
   json += "\"ticksPerGear\":" + String(ticksPerGear) + ",";
   json += "\"moveUnit\":\"" + String(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears") + "\",";
   json += "\"moveAmount\":" + String(uiMoveAmount, 3) + ",";
+  json += "\"degreeStep\":" + String(degreeStepSetting, 3) + ",";
   json += "\"speed\":" + String(speedStepsPerSec, 1) + ",";
   json += "\"accel\":" + String(accelStepsPerSec2, 1) + ",";
+  json += "\"backlash\":" + String(backlashSteps) + ",";
   json += "\"b1\":" + String(button1Pressed ? "true" : "false") + ",";
   json += "\"b2\":" + String(button2Pressed ? "true" : "false") + ",";
-  json += "\"hasCfg\":" + String(hasStoredNetworkConfig ? "true" : "false");
+  json += "\"hasCfg\":" + String(hasStoredNetworkConfig ? "true" : "false") + ",";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"rssi\":" + String((wifiMode == "STA") ? WiFi.RSSI() : 0) + ",";
+  json += "\"isrHz\":" + String(diagIsrTicksPerSec) + ",";
+  json += "\"stepHz\":" + String(diagStepRatePerSec) + ",";
+  json += "\"missedEst\":" + String(missedStepEstimate) + ",";
+  json += "\"lastFault\":\"" + jsonEscape(lastFault) + "\",";
+  json += "\"p1\":\"" + jsonEscape(presets[0].name) + "\",";
+  json += "\"p2\":\"" + jsonEscape(presets[1].name) + "\",";
+  json += "\"p3\":\"" + jsonEscape(presets[2].name) + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1101,12 +1536,15 @@ void handleStepperStop() {
   long pos = stepperPosition;
   targetPosition = pos;
   commandedStepsFromZero = static_cast<double>(pos);
+  lastCommandDir = 0;
   interrupts();
+  degreeIdealSynced = false;
   server.send(200, "text/plain", "OK");
 }
 
 void handleStepperMove() {
   Serial.println("[HTTP] /stepper/move");
+  normalizeStepFrameIfIdle();
   if (!stepperEnabled) {
     Serial.println("[STEP] move rejected: disabled");
     server.send(409, "text/plain", "Stepper is disabled");
@@ -1131,10 +1569,12 @@ void handleStepperMove() {
     applyStepperSpeed();
   }
   long nextTarget = currentPos + steps;
+  nextTarget = applyBacklashCompensation(currentPos, nextTarget);
   if (nextTarget != currentPos) {
     showMovingScreen();
   }
   setTargetAndCommandedAtomic(nextTarget);
+  degreeIdealSynced = false;
   Serial.print("[STEP] move target=");
   Serial.println(nextTarget);
   server.send(200, "text/plain", "OK");
@@ -1142,6 +1582,7 @@ void handleStepperMove() {
 
 void handleStepperSingleStep() {
   Serial.println("[HTTP] /stepper/single");
+  normalizeStepFrameIfIdle();
   if (!stepperEnabled) {
     Serial.println("[STEP] single step rejected: disabled");
     server.send(409, "text/plain", "Stepper is disabled");
@@ -1150,10 +1591,12 @@ void handleStepperSingleStep() {
   int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
   long currentPos = getStepperPositionAtomic();
   long nextTarget = currentPos + ((dir < 0) ? -1L : 1L);
+  nextTarget = applyBacklashCompensation(currentPos, nextTarget);
   if (nextTarget != currentPos) {
     showMovingScreen();
   }
   setTargetAndCommandedAtomic(nextTarget);
+  degreeIdealSynced = false;
   Serial.print("[STEP] single queued dir=");
   Serial.print(dir);
   Serial.print(" target=");
@@ -1205,6 +1648,7 @@ void handleStepperAccel() {
 
 void handleIndexerStep() {
   Serial.println("[HTTP] /indexer/step");
+  normalizeStepFrameIfIdle();
   if (!stepperEnabled) {
     Serial.println("[STEP] index step rejected: disabled");
     server.send(409, "text/plain", "Stepper is disabled");
@@ -1213,6 +1657,7 @@ void handleIndexerStep() {
   int dir = server.hasArg("dir") ? server.arg("dir").toInt() : 1;
   long currentPos = getStepperPositionAtomic();
   long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, dir, uiMoveUnit, uiMoveAmount);
+  nextTarget = applyBacklashCompensation(currentPos, nextTarget);
   if (stepperOutputsReleased) {
     hardEnableStepperPins();
     applyStepperSpeed();
@@ -1261,6 +1706,9 @@ void handleMoveConfig() {
   if (unit == "degrees") {
     uiMoveUnit = MoveUnit::Degrees;
     uiMoveAmount = amount;
+    degreeStepSetting = amount;
+    syncDegreeIdealToPosition(getStepperPositionAtomic());
+    saveControlSettings();
   } else {
     uiMoveUnit = MoveUnit::Gears;
     int nextGears = static_cast<int>(lround(amount));
@@ -1271,6 +1719,7 @@ void handleMoveConfig() {
     numberOfGears = nextGears;
     recalcIndexerTicks();
     uiMoveAmount = 1.0f;
+    degreeIdealSynced = false;
   }
   Serial.print("[MOVE] unit=");
   Serial.print(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears");
@@ -1285,7 +1734,9 @@ void handleIndexerZero() {
   targetPosition = 0;
   commandedStepsFromZero = 0.0;
   timerMotionActive = false;
+  lastCommandDir = 0;
   interrupts();
+  syncDegreeIdealToPosition(0);
   Serial.println("[INDEX] zeroed current position reference");
   server.send(200, "text/plain", "OK");
 }
@@ -1313,11 +1764,110 @@ void handleIndexerSetPositionDeg() {
   targetPosition = pos;
   commandedStepsFromZero = static_cast<double>(pos);
   timerMotionActive = false;
+  lastCommandDir = 0;
   interrupts();
+  syncDegreeIdealToPosition(pos);
   Serial.print("[INDEX] set position deg=");
   Serial.print(deg, 3);
   Serial.print(" steps=");
   Serial.println(pos);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleIndexerSetPositionGear() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing value");
+    return;
+  }
+  int gear = server.arg("value").toInt();
+  if (gear < 1 || gear > numberOfGears) {
+    server.send(400, "text/plain", "Gear out of range");
+    return;
+  }
+  long pos = lround((static_cast<double>(gear - 1) * static_cast<double>(STEPS_PER_INDEXER_REV)) /
+                    static_cast<double>(numberOfGears));
+  noInterrupts();
+  stepperPosition = pos;
+  targetPosition = pos;
+  commandedStepsFromZero = static_cast<double>(pos);
+  timerMotionActive = false;
+  lastCommandDir = 0;
+  interrupts();
+  syncDegreeIdealToPosition(pos);
+  Serial.print("[INDEX] set position gear=");
+  Serial.print(gear);
+  Serial.print(" steps=");
+  Serial.println(pos);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetBacklash() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing value");
+    return;
+  }
+  long v = server.arg("value").toInt();
+  if (v < 0) v = 0;
+  if (v > 200000) v = 200000;
+  backlashSteps = v;
+  saveControlSettings();
+  server.send(200, "text/plain", "OK");
+}
+
+void handlePresetSave() {
+  if (!server.hasArg("slot")) {
+    server.send(400, "text/plain", "Missing slot");
+    return;
+  }
+  int slot = server.arg("slot").toInt();
+  if (slot < 1 || slot > 3) {
+    server.send(400, "text/plain", "Slot must be 1..3");
+    return;
+  }
+  int i = slot - 1;
+  presets[i].name = server.hasArg("name") ? server.arg("name") : ("Preset " + String(slot));
+  if (presets[i].name.length() == 0) {
+    presets[i].name = "Preset " + String(slot);
+  }
+  presets[i].gears = numberOfGears;
+  presets[i].degreeStep = degreeStepSetting;
+  presets[i].speed = speedStepsPerSec;
+  presets[i].accel = accelStepsPerSec2;
+  savePresetSlot(i);
+  server.send(200, "text/plain", "OK");
+}
+
+void handlePresetLoad() {
+  if (!server.hasArg("slot")) {
+    server.send(400, "text/plain", "Missing slot");
+    return;
+  }
+  int slot = server.arg("slot").toInt();
+  if (slot < 1 || slot > 3) {
+    server.send(400, "text/plain", "Slot must be 1..3");
+    return;
+  }
+  int i = slot - 1;
+  numberOfGears = presets[i].gears;
+  if (numberOfGears < 1) numberOfGears = 1;
+  recalcIndexerTicks();
+  degreeStepSetting = presets[i].degreeStep;
+  if (degreeStepSetting <= 0.0f) degreeStepSetting = 10.0f;
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    uiMoveAmount = degreeStepSetting;
+  } else {
+    uiMoveAmount = 1.0f;
+  }
+  speedStepsPerSec = presets[i].speed;
+  if (speedStepsPerSec < 5.0f) speedStepsPerSec = 5.0f;
+  accelStepsPerSec2 = presets[i].accel;
+  if (accelStepsPerSec2 < 5.0f) accelStepsPerSec2 = 5.0f;
+  applyStepperSpeed();
+  noInterrupts();
+  timerStepIntervalRequestUs = stepIntervalUs;
+  timerStepIntervalDirty = true;
+  interrupts();
+  saveControlSettings();
   server.send(200, "text/plain", "OK");
 }
 
@@ -1393,6 +1943,10 @@ void setupWeb() {
   server.on("/indexer/set_gears", HTTP_POST, handleIndexerSetGears);
   server.on("/indexer/zero", HTTP_POST, handleIndexerZero);
   server.on("/indexer/set_position_deg", HTTP_POST, handleIndexerSetPositionDeg);
+  server.on("/indexer/set_position_gear", HTTP_POST, handleIndexerSetPositionGear);
+  server.on("/settings/backlash", HTTP_POST, handleSetBacklash);
+  server.on("/preset/save", HTTP_POST, handlePresetSave);
+  server.on("/preset/load", HTTP_POST, handlePresetLoad);
   server.on("/move/config", HTTP_POST, handleMoveConfig);
   server.on("/config/network", HTTP_POST, handleSaveNetworkConfig);
   server.begin();
@@ -1503,6 +2057,8 @@ void setupWifi() {
 void readButtons() {
   bool b1 = digitalRead(BTN1_PIN);
   bool b2 = digitalRead(BTN2_PIN);
+  bool b3 = digitalRead(BTN3_PIN);
+  bool b4 = digitalRead(BTN4_PIN);
   unsigned long now = millis();
 
   if (b1 != lastBtn1Read) {
@@ -1512,6 +2068,14 @@ void readButtons() {
   if (b2 != lastBtn2Read) {
     lastBtn2EdgeMs = now;
     lastBtn2Read = b2;
+  }
+  if (b3 != lastBtn3Read) {
+    lastBtn3EdgeMs = now;
+    lastBtn3Read = b3;
+  }
+  if (b4 != lastBtn4Read) {
+    lastBtn4EdgeMs = now;
+    lastBtn4Read = b4;
   }
 
   if (now - lastBtn1EdgeMs > DEBOUNCE_MS) {
@@ -1530,44 +2094,118 @@ void readButtons() {
       Serial.println(button2Pressed ? "PRESSED" : "RELEASED");
     }
   }
+  if (now - lastBtn3EdgeMs > DEBOUNCE_MS) {
+    bool newState = (b3 == LOW);
+    if (newState != button3Pressed) {
+      button3Pressed = newState;
+      Serial.print("[BTN] B3 ");
+      Serial.println(button3Pressed ? "PRESSED" : "RELEASED");
+    }
+  }
+  if (now - lastBtn4EdgeMs > DEBOUNCE_MS) {
+    bool newState = (b4 == LOW);
+    if (newState != button4Pressed) {
+      button4Pressed = newState;
+      Serial.print("[BTN] B4 ");
+      Serial.println(button4Pressed ? "PRESSED" : "RELEASED");
+    }
+  }
 }
 
 void handleButtonActions() {
-  if (!stepperEnabled) {
+  static bool lastActionB1 = false;
+  static bool lastActionB2 = false;
+  static bool lastActionB3 = false;
+  static bool lastActionB4 = false;
+  bool b1Edge = button1Pressed && !lastActionB1;
+  bool b2Edge = button2Pressed && !lastActionB2;
+  bool b3Edge = button3Pressed && !lastActionB3;
+  bool b4Edge = button4Pressed && !lastActionB4;
+
+  // B3: display page cycle (keeps original physical behavior)
+  if (b3Edge) {
+    if (oledPage == OledPage::Status) {
+      oledPage = OledPage::Motion;
+    } else if (oledPage == OledPage::Motion) {
+      oledPage = OledPage::Diag;
+    } else if (oledPage == OledPage::Diag) {
+      oledPage = OledPage::Setup;
+      beginOledSetupWizard();
+    } else {
+      oledPage = OledPage::Status;
+    }
+    Serial.print("[BTN] B3 display page=");
+    Serial.println(static_cast<int>(oledPage));
+    renderOledStatus();
+  }
+
+  // Setup page uses B1/B3/B4 for configuration flow.
+  if (oledPage == OledPage::Setup) {
+    // Keep original physical behavior with relabeled buttons:
+    // old B1/B3/B4 -> new B4/B2/B1
+    handleSetupWizardButtons(b4Edge, b2Edge, b1Edge);
+    lastActionB1 = button1Pressed;
+    lastActionB2 = button2Pressed;
+    lastActionB3 = button3Pressed;
+    lastActionB4 = button4Pressed;
     return;
   }
 
-  static bool lastActionB1 = false;
-  static bool lastActionB2 = false;
+  // B2: stop motion (keeps original physical behavior)
+  if (b2Edge) {
+    noInterrupts();
+    long pos = stepperPosition;
+    targetPosition = pos;
+    commandedStepsFromZero = static_cast<double>(pos);
+    timerMotionActive = false;
+    lastCommandDir = 0;
+    interrupts();
+    Serial.println("[BTN] B2 stop");
+    renderOledStatus();
+  }
 
-  if (button1Pressed && !lastActionB1) {
+  if (!stepperEnabled) {
+    lastActionB1 = button1Pressed;
+    lastActionB2 = button2Pressed;
+    lastActionB3 = button3Pressed;
+    lastActionB4 = button4Pressed;
+    return;
+  }
+
+  // B4: next (keeps original physical behavior)
+  if (b4Edge) {
+    normalizeStepFrameIfIdle();
     long currentPos = getStepperPositionAtomic();
     if (stepperOutputsReleased) {
       hardEnableStepperPins();
       applyStepperSpeed();
     }
-    long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, -1, uiMoveUnit, uiMoveAmount);  // B1 rewinds
+    long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, 1, uiMoveUnit, uiMoveAmount);  // B1 next
+    nextTarget = applyBacklashCompensation(currentPos, nextTarget);
     if (nextTarget != currentPos) {
       showMovingScreen();
     }
     setTargetAndCommandedAtomic(nextTarget);
-    Serial.print("[BTN] B1 action: rewind ");
+    Serial.print("[BTN] B4 action: next ");
     Serial.print(uiMoveAmount, 3);
     Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
     Serial.println(targetPosition);
   }
-  if (button2Pressed && !lastActionB2) {
+  // B1: previous (keeps original physical behavior)
+  if (b1Edge) {
+    normalizeStepFrameIfIdle();
     long currentPos = getStepperPositionAtomic();
     if (stepperOutputsReleased) {
       hardEnableStepperPins();
       applyStepperSpeed();
     }
-    long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, 1, uiMoveUnit, uiMoveAmount);  // B2 advances
+    long nextTarget = computeIndexedAbsoluteTargetFromCurrent(currentPos, -1, uiMoveUnit, uiMoveAmount);  // B4 previous
+    nextTarget = applyBacklashCompensation(currentPos, nextTarget);
     if (nextTarget != currentPos) {
       showMovingScreen();
     }
     setTargetAndCommandedAtomic(nextTarget);
-    Serial.print("[BTN] B2 action: advance ");
+    Serial.print("[BTN] B1 action: previous ");
     Serial.print(uiMoveAmount, 3);
     Serial.print(uiMoveUnit == MoveUnit::Degrees ? " deg, target=" : " gear, target=");
     Serial.println(targetPosition);
@@ -1575,6 +2213,8 @@ void handleButtonActions() {
 
   lastActionB1 = button1Pressed;
   lastActionB2 = button2Pressed;
+  lastActionB3 = button3Pressed;
+  lastActionB4 = button4Pressed;
 }
 
 void updateDisplay() {
@@ -1652,9 +2292,19 @@ void setup() {
   Serial.println(accelStepsPerSec2);
   Serial.print("[BOOT] standby wake us=");
   Serial.println(TB_STANDBY_WAKE_US);
+  Serial.print("[BOOT] buttons B1/B2/B3/B4 = ");
+  Serial.print(BTN1_PIN);
+  Serial.print("/");
+  Serial.print(BTN2_PIN);
+  Serial.print("/");
+  Serial.print(BTN3_PIN);
+  Serial.print("/");
+  Serial.println(BTN4_PIN);
 
   pinMode(BTN1_PIN, INPUT_PULLUP);
   pinMode(BTN2_PIN, INPUT_PULLUP);
+  pinMode(BTN3_PIN, INPUT_PULLUP);
+  pinMode(BTN4_PIN, INPUT_PULLUP);
   pinMode(STEPPER_IN1, OUTPUT);
   pinMode(STEPPER_IN2, OUTPUT);
   pinMode(STEPPER_IN3, OUTPUT);
@@ -1667,6 +2317,12 @@ void setup() {
   if (!oledOk) {
     Serial.println("[OLED] init failed on configured I2C pins");
     oledReady = false;
+  }
+
+  loadControlSettings();
+  loadPresets();
+  if (uiMoveUnit == MoveUnit::Degrees) {
+    uiMoveAmount = degreeStepSetting;
   }
 
   applyStepperSpeed();
@@ -1692,9 +2348,10 @@ void setup() {
     Serial.println("[STEP] failed to create hardware timer");
   }
 
+  // Always clear the RGB chain at boot so stale/latching LED state is reset.
   rgbLeds.begin();
   rgbLeds.clear();
-  rgbLeds.setBrightness(40);
+  rgbLeds.setBrightness(USE_STATUS_LED ? 40 : 0);
   rgbLeds.show();
 
   hasStoredNetworkConfig = loadNetworkConfig(savedConfig);
@@ -1710,7 +2367,28 @@ void setup() {
 void loop() {
   static unsigned long lastBackgroundUs = 0;
   static unsigned long lastMotionLogMs = 0;
+  static uint32_t prevIsrTicks = 0;
+  static uint32_t prevIsrSteps = 0;
+  static unsigned long lastDiagMs = 0;
   bool moving = stepperEnabled && (stepperPosition != targetPosition);
+
+  if (millis() - lastDiagMs >= 1000) {
+    uint32_t ticksNow = 0;
+    uint32_t stepsNow = 0;
+    noInterrupts();
+    ticksNow = isrTickCounter;
+    stepsNow = isrStepCounter;
+    interrupts();
+    diagIsrTicksPerSec = ticksNow - prevIsrTicks;
+    diagStepRatePerSec = stepsNow - prevIsrSteps;
+    prevIsrTicks = ticksNow;
+    prevIsrSteps = stepsNow;
+    if (diagStepRatePerSec == 0 && moving) {
+      missedStepEstimate++;
+      lastFault = "STEP_RATE_ZERO";
+    }
+    lastDiagMs = millis();
+  }
 
   if (moving && millis() - lastMotionLogMs >= 1000) {
     uint32_t activeIntervalUs = 0;
@@ -1732,7 +2410,9 @@ void loop() {
     Serial.print(" actHz=");
     Serial.print(activeStepsPerSec, 1);
     Serial.print(" actRPM=");
-    Serial.println(activeRpm, 1);
+    Serial.print(activeRpm, 1);
+    Serial.print(" torqueMode=");
+    Serial.println(highTorqueModeActive ? "HIGH" : "NORMAL");
     lastMotionLogMs = millis();
   }
 
