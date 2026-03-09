@@ -44,17 +44,14 @@ constexpr uint8_t HMAC_KEY[32] = {
 #define STEPPER_PORT 2
 #endif
 
-#if STEPPER_PORT == 1
-constexpr uint8_t STEPPER_IN1 = 27;
-constexpr uint8_t STEPPER_IN2 = 13;
-constexpr uint8_t STEPPER_IN3 = 4;
-constexpr uint8_t STEPPER_IN4 = 2;
-#else
-constexpr uint8_t STEPPER_IN1 = 17;
-constexpr uint8_t STEPPER_IN2 = 12;
-constexpr uint8_t STEPPER_IN3 = 15;
-constexpr uint8_t STEPPER_IN4 = 14;
-#endif
+constexpr uint8_t STEP1_IN1 = 27;
+constexpr uint8_t STEP1_IN2 = 13;
+constexpr uint8_t STEP1_IN3 = 4;
+constexpr uint8_t STEP1_IN4 = 2;
+constexpr uint8_t STEP2_IN1 = 17;
+constexpr uint8_t STEP2_IN2 = 12;
+constexpr uint8_t STEP2_IN3 = 15;
+constexpr uint8_t STEP2_IN4 = 14;
 
 // Physical button inputs, labeled left-to-right on PCB as B1, B2, B3, B4.
 constexpr uint8_t BTN1_PIN = 26;  // Left-most
@@ -85,6 +82,11 @@ volatile bool button3Pressed = false;
 volatile bool button4Pressed = false;
 volatile bool stepperEnabled = true;
 bool stepperOutputsReleased = false;
+uint8_t stepperPort = STEPPER_PORT;
+uint8_t stepperIn1 = (STEPPER_PORT == 1) ? STEP1_IN1 : STEP2_IN1;
+uint8_t stepperIn2 = (STEPPER_PORT == 1) ? STEP1_IN2 : STEP2_IN2;
+uint8_t stepperIn3 = (STEPPER_PORT == 1) ? STEP1_IN3 : STEP2_IN3;
+uint8_t stepperIn4 = (STEPPER_PORT == 1) ? STEP1_IN4 : STEP2_IN4;
 volatile long stepperPosition = 0;
 volatile long targetPosition = 0;
 float speedStepsPerSec = 5500.0f;
@@ -170,7 +172,7 @@ uint32_t diagStepRatePerSec = 0;
 long missedStepEstimate = 0;
 enum class OledPage : uint8_t { Status = 0, Motion = 1, Diag = 2, Setup = 3 };
 OledPage oledPage = OledPage::Status;
-enum class DiagBridgeMode : uint8_t { Off = 0, M3On = 1, M4On = 2 };
+enum class DiagBridgeMode : uint8_t { Off = 0, M1On = 1, M2On = 2, M3On = 3, M4On = 4 };
 DiagBridgeMode diagBridgeMode = DiagBridgeMode::Off;
 enum class SetupStage : uint8_t { Zero = 0, Mode = 1, Value = 2 };
 SetupStage setupStage = SetupStage::Zero;
@@ -213,7 +215,10 @@ void handleSetupWizardButtons(bool b1Edge, bool b3Edge, bool b4Edge);
 void syncDegreeIdealToPosition(long pos);
 long computeDegreeModeTarget(long currentPos, int dir, float amount);
 void handleDiagResetIsd();
+void handleDiagResetIsdPort();
 void handleDiagBridgeMode();
+void applyStepperPortSelection(uint8_t port);
+void handleSetStepperPort();
 
 long modPositive(long value, long mod) {
   long out = value % mod;
@@ -346,6 +351,24 @@ void setTargetAndCommandedAtomic(long value) {
   interrupts();
 }
 
+void applyStepperPortSelection(uint8_t port) {
+  if (port != 1 && port != 2) {
+    port = 2;
+  }
+  stepperPort = port;
+  if (stepperPort == 1) {
+    stepperIn1 = STEP1_IN1;
+    stepperIn2 = STEP1_IN2;
+    stepperIn3 = STEP1_IN3;
+    stepperIn4 = STEP1_IN4;
+  } else {
+    stepperIn1 = STEP2_IN1;
+    stepperIn2 = STEP2_IN2;
+    stepperIn3 = STEP2_IN3;
+    stepperIn4 = STEP2_IN4;
+  }
+}
+
 long applyBacklashCompensation(long currentPos, long nextTarget) {
   int dir = 0;
   if (nextTarget > currentPos) dir = 1;
@@ -363,15 +386,18 @@ void loadControlSettings() {
   prefs.begin("ctrlcfg", true);
   backlashSteps = prefs.getLong("backlash", 0);
   degreeStepSetting = prefs.getFloat("deg_step", 10.0f);
+  int savedPort = prefs.getInt("stepper_port", STEPPER_PORT);
   prefs.end();
   if (backlashSteps < 0) backlashSteps = 0;
   if (degreeStepSetting <= 0.0f) degreeStepSetting = 10.0f;
+  applyStepperPortSelection(static_cast<uint8_t>(savedPort));
 }
 
 void saveControlSettings() {
   prefs.begin("ctrlcfg", false);
   prefs.putLong("backlash", backlashSteps);
   prefs.putFloat("deg_step", degreeStepSetting);
+  prefs.putInt("stepper_port", stepperPort);
   prefs.end();
 }
 
@@ -781,10 +807,10 @@ void setFirstLedColor(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void IRAM_ATTR writeStepperOutputs(bool in1, bool in2, bool in3, bool in4) {
-  const uint32_t pin1Mask = (1UL << STEPPER_IN1);
-  const uint32_t pin2Mask = (1UL << STEPPER_IN2);
-  const uint32_t pin3Mask = (1UL << STEPPER_IN3);
-  const uint32_t pin4Mask = (1UL << STEPPER_IN4);
+  const uint32_t pin1Mask = (1UL << stepperIn1);
+  const uint32_t pin2Mask = (1UL << stepperIn2);
+  const uint32_t pin3Mask = (1UL << stepperIn3);
+  const uint32_t pin4Mask = (1UL << stepperIn4);
   const uint32_t allMask = pin1Mask | pin2Mask | pin3Mask | pin4Mask;
   uint32_t setMask = 0;
   if (in1) setMask |= pin1Mask;
@@ -830,16 +856,27 @@ void applyDiagBridgeModeOutput() {
   if (diagBridgeMode == DiagBridgeMode::Off) {
     return;
   }
-  if (tbInStandby || stepperOutputsReleased) {
-    hardEnableStepperPins();
-  }
-  if (diagBridgeMode == DiagBridgeMode::M3On) {
-    // M3 bridge ON: IN1=H, IN2=L
-    writeStepperOutputs(true, false, false, false);
+  // Force all bridge inputs low first so only one selected bridge is active.
+  digitalWrite(STEP1_IN1, LOW);
+  digitalWrite(STEP1_IN2, LOW);
+  digitalWrite(STEP1_IN3, LOW);
+  digitalWrite(STEP1_IN4, LOW);
+  digitalWrite(STEP2_IN1, LOW);
+  digitalWrite(STEP2_IN2, LOW);
+  digitalWrite(STEP2_IN3, LOW);
+  digitalWrite(STEP2_IN4, LOW);
+
+  if (diagBridgeMode == DiagBridgeMode::M1On) {
+    digitalWrite(STEP1_IN1, HIGH);
+  } else if (diagBridgeMode == DiagBridgeMode::M2On) {
+    digitalWrite(STEP1_IN3, HIGH);
+  } else if (diagBridgeMode == DiagBridgeMode::M3On) {
+    digitalWrite(STEP2_IN1, HIGH);
   } else if (diagBridgeMode == DiagBridgeMode::M4On) {
-    // M4 bridge ON: IN3=H, IN4=L
-    writeStepperOutputs(false, false, true, false);
+    digitalWrite(STEP2_IN3, HIGH);
   }
+  tbInStandby = false;
+  stepperOutputsReleased = false;
 }
 
 void setStepperPhase(int phase) {
@@ -1340,17 +1377,18 @@ String htmlPage() {
   h += F(".net{margin-top:8px;padding:10px;border:1px dashed #9ab2cc;border-radius:12px;background:#f8fbff}");
   h += F("@media (max-width:800px){.grid{grid-template-columns:1fr}.shell{padding:10px}button,input{flex:1}}");
   h += F("</style></head><body><div class='shell'><h1 class='title'>Divider Indexer Controller</h1>");
-  h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button><button class='secondary' onclick='toggleDiagnostics()'>Diagnostics</button><button class='secondary' onclick='toggleOperatorMode()'>Operator Mode</button></div>");
+  h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button><button class='secondary' onclick='toggleDiagnostics()'>Diagnostics</button><button id='operatorModeBtn' class='secondary' onclick='toggleOperatorMode()'>Lock Operator Screen</button></div>");
   h += F("<div id='settingsPanel' class='card settings advanced'><div class='row'><input id='speed' type='number' value='5500' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
   h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
   h += F("<div class='row'><input id='backlash' type='number' value='0' min='0' step='1' oninput='markDirty(\"backlash\")'><button class='secondary' onclick='setBacklash()'>Set Backlash (steps)</button></div>");
+  h += F("<div class='row'><select id='stepperPort' oninput='markDirty(\"stepperPort\")'><option value='1'>Stepper1 (M1/M2)</option><option value='2'>Stepper2 (M3/M4)</option></select><button class='secondary' onclick='setStepperPort()'>Set Stepper Port</button></div>");
   h += F("<div class='row'><input id='setPosDeg' type='number' value='0' min='0' max='360' step='0.001'><button class='secondary' onclick='setPositionDeg()'>Set Absolute Deg</button></div>");
   h += F("<div class='row'><input id='setPosGear' type='number' value='1' min='1' step='1'><button class='secondary' onclick='setPositionGear()'>Set Absolute Gear</button></div>");
   h += F("<div class='row'><button class='secondary' onclick='zeroPosition()'>Zero Position</button></div>");
   h += F("<div class='row'><input id='p1name' placeholder='Preset 1 name'><button class='secondary' onclick='presetSave(1)'>Save P1</button><button class='secondary' onclick='presetLoad(1)'>Load P1</button></div>");
   h += F("<div class='row'><input id='p2name' placeholder='Preset 2 name'><button class='secondary' onclick='presetSave(2)'>Save P2</button><button class='secondary' onclick='presetLoad(2)'>Load P2</button></div>");
   h += F("<div class='row'><input id='p3name' placeholder='Preset 3 name'><button class='secondary' onclick='presetSave(3)'>Save P3</button><button class='secondary' onclick='presetLoad(3)'>Load P3</button></div></div>");
-  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
+  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD (Active)</button><button class='secondary' onclick='diagResetIsdPort(1)'>Reset ISD S1</button><button class='secondary' onclick='diagResetIsdPort(2)'>Reset ISD S2</button></div><div class='row'><button class='secondary' onclick='diagBridgeMode(\"m1\")'>M1 ON</button><button class='secondary' onclick='diagBridgeMode(\"m2\")'>M2 ON</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
   h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
@@ -1426,18 +1464,21 @@ String htmlPage() {
   h += F("async function cmd(u){await fetch(u,{method:'POST'});refresh();}");
   h += F("function toggleSettings(){const p=document.getElementById('settingsPanel');if(!p)return;p.style.display=(p.style.display==='block')?'none':'block';}");
   h += F("function toggleDiagnostics(){const p=document.getElementById('diagPanel');if(!p)return;p.style.display=(p.style.display==='block')?'none':'block';}");
-  h += F("function toggleOperatorMode(){document.body.classList.toggle('operator');}");
+  h += F("function updateOperatorModeBtn(){const b=document.getElementById('operatorModeBtn');if(!b)return;b.innerText=document.body.classList.contains('operator')?'Unlock Operator Screen':'Lock Operator Screen';}");
+  h += F("function toggleOperatorMode(){document.body.classList.toggle('operator');updateOperatorModeBtn();}");
   h += F("const dirtyFields=new Set();");
   h += F("function markDirty(id){dirtyFields.add(id);}function clearDirty(id){dirtyFields.delete(id);}");
   h += F("async function setSpeed(){const s=document.getElementById('speed').value||5500;const r=await fetch('/stepper/speed?value='+s,{method:'POST'});if(r.ok)clearDirty('speed');refresh();}");
   h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;const r=await fetch('/stepper/accel?value='+a,{method:'POST'});if(r.ok)clearDirty('accel');refresh();}");
   h += F("async function setBacklash(){const v=document.getElementById('backlash').value||0;const r=await fetch('/settings/backlash?value='+encodeURIComponent(v),{method:'POST'});if(r.ok)clearDirty('backlash');refresh();}");
+  h += F("async function setStepperPort(){const v=document.getElementById('stepperPort').value||'2';const r=await fetch('/settings/stepper_port?value='+encodeURIComponent(v),{method:'POST'});if(r.ok)clearDirty('stepperPort');refresh();}");
   h += F("async function setPositionDeg(){const d=document.getElementById('setPosDeg').value||0;if(!confirm('Set current absolute position to '+d+' degrees?'))return;const r=await fetch('/indexer/set_position_deg?value='+encodeURIComponent(d),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function setPositionGear(){const g=document.getElementById('setPosGear').value||1;if(!confirm('Set current absolute position to gear '+g+'?'))return;const r=await fetch('/indexer/set_position_gear?value='+encodeURIComponent(g),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function zeroPosition(){const r=await fetch('/indexer/zero',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function presetSave(slot){const n=(document.getElementById('p'+slot+'name')||{}).value||('Preset '+slot);const p=new URLSearchParams({slot:String(slot),name:n});const r=await fetch('/preset/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function presetLoad(slot){const r=await fetch('/preset/load?slot='+slot,{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function diagResetIsd(){const r=await fetch('/diag/reset_isd',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function diagResetIsdPort(port){const r=await fetch('/diag/reset_isd_port?port='+encodeURIComponent(port),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function diagBridgeMode(mode){const r=await fetch('/diag/bridge_mode?mode='+encodeURIComponent(mode),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
   h += F("function onMoveUnitChanged(){const u=document.getElementById('moveUnit').value;const lbl=document.getElementById('moveLabel');const m=document.getElementById('moveAmount');");
@@ -1467,14 +1508,14 @@ String htmlPage() {
   h += F("const m=document.getElementById('moveAmount');if(!m)return;m.min=(j.moveUnit==='degrees')?'0.001':'1';m.step=(j.moveUnit==='degrees')?'0.001':'1';");
   h += F("if(document.activeElement!==m&&!dirtyFields.has('moveAmount')){m.value=(j.moveUnit==='degrees')?j.degreeStep:j.gears;}}");
   h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();");
-  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('backlash',j.backlash);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);");
+  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('backlash',j.backlash);setIfIdle('stepperPort',j.stepperPort);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);");
   h += F("const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}");
   h += F("document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';");
   h += F("document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';");
   h += F("document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nCommanded ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nErr ${j.positionError} steps`;");
   h += F("const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nBacklash: ${j.backlash} steps\\nBridgeTest: ${j.diagBridgeMode}\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}");
   h += F("renderDial(j.indexerDeg);updateDialContext(j);}");
-  h += F("setInterval(refresh,1000);refresh();");
+  h += F("setInterval(refresh,1000);refresh();updateOperatorModeBtn();");
   h += F("</script></body></html>");
   return h;
 }
@@ -1502,6 +1543,7 @@ void sendJsonStatus() {
   json += "\"indexerDeg\":" + String(actualDeg, 3) + ",";
   json += "\"cmdDeg\":" + String(cmdDeg, 3) + ",";
   json += "\"gears\":" + String(numberOfGears) + ",";
+  json += "\"stepperPort\":" + String(stepperPort) + ",";
   json += "\"currentGear\":" + String(currentGear) + ",";
   json += "\"ticksPerGear\":" + String(ticksPerGear) + ",";
   json += "\"moveUnit\":\"" + String(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears") + "\",";
@@ -1518,7 +1560,12 @@ void sendJsonStatus() {
   json += "\"isrHz\":" + String(diagIsrTicksPerSec) + ",";
   json += "\"stepHz\":" + String(diagStepRatePerSec) + ",";
   json += "\"missedEst\":" + String(missedStepEstimate) + ",";
-  json += "\"diagBridgeMode\":\"" + String(diagBridgeMode == DiagBridgeMode::M3On ? "m3" : (diagBridgeMode == DiagBridgeMode::M4On ? "m4" : "off")) + "\",";
+  String diagMode = "off";
+  if (diagBridgeMode == DiagBridgeMode::M1On) diagMode = "m1";
+  else if (diagBridgeMode == DiagBridgeMode::M2On) diagMode = "m2";
+  else if (diagBridgeMode == DiagBridgeMode::M3On) diagMode = "m3";
+  else if (diagBridgeMode == DiagBridgeMode::M4On) diagMode = "m4";
+  json += "\"diagBridgeMode\":\"" + diagMode + "\",";
   json += "\"lastFault\":\"" + jsonEscape(lastFault) + "\",";
   json += "\"p1\":\"" + jsonEscape(presets[0].name) + "\",";
   json += "\"p2\":\"" + jsonEscape(presets[1].name) + "\",";
@@ -1814,6 +1861,53 @@ void handleSetBacklash() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleSetStepperPort() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing value");
+    return;
+  }
+  int v = server.arg("value").toInt();
+  if (v != 1 && v != 2) {
+    server.send(400, "text/plain", "Stepper port must be 1 or 2");
+    return;
+  }
+
+  noInterrupts();
+  long pos = stepperPosition;
+  targetPosition = pos;
+  commandedStepsFromZero = static_cast<double>(pos);
+  timerMotionActive = false;
+  outputCommand = OUTPUT_CMD_NONE;
+  interrupts();
+
+  diagBridgeMode = DiagBridgeMode::Off;
+  hardDisableStepperPins();
+  applyStepperPortSelection(static_cast<uint8_t>(v));
+
+  // Keep all possible driver pins configured and de-energized after switch.
+  pinMode(STEP1_IN1, OUTPUT);
+  pinMode(STEP1_IN2, OUTPUT);
+  pinMode(STEP1_IN3, OUTPUT);
+  pinMode(STEP1_IN4, OUTPUT);
+  pinMode(STEP2_IN1, OUTPUT);
+  pinMode(STEP2_IN2, OUTPUT);
+  pinMode(STEP2_IN3, OUTPUT);
+  pinMode(STEP2_IN4, OUTPUT);
+  digitalWrite(STEP1_IN1, LOW);
+  digitalWrite(STEP1_IN2, LOW);
+  digitalWrite(STEP1_IN3, LOW);
+  digitalWrite(STEP1_IN4, LOW);
+  digitalWrite(STEP2_IN1, LOW);
+  digitalWrite(STEP2_IN2, LOW);
+  digitalWrite(STEP2_IN3, LOW);
+  digitalWrite(STEP2_IN4, LOW);
+
+  saveControlSettings();
+  Serial.print("[CFG] stepper_port=");
+  Serial.println(stepperPort);
+  server.send(200, "text/plain", "OK");
+}
+
 void handlePresetSave() {
   if (!server.hasArg("slot")) {
     server.send(400, "text/plain", "Missing slot");
@@ -1955,20 +2049,67 @@ void handleDiagResetIsd() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleDiagResetIsdPort() {
+  if (!server.hasArg("port")) {
+    server.send(400, "text/plain", "Missing port");
+    return;
+  }
+  int port = server.arg("port").toInt();
+  if (port != 1 && port != 2) {
+    server.send(400, "text/plain", "port must be 1 or 2");
+    return;
+  }
+
+  uint8_t in1 = (port == 1) ? STEP1_IN1 : STEP2_IN1;
+  uint8_t in2 = (port == 1) ? STEP1_IN2 : STEP2_IN2;
+  uint8_t in3 = (port == 1) ? STEP1_IN3 : STEP2_IN3;
+  uint8_t in4 = (port == 1) ? STEP1_IN4 : STEP2_IN4;
+
+  noInterrupts();
+  timerMotionActive = false;
+  outputCommand = OUTPUT_CMD_NONE;
+  interrupts();
+
+  // Datasheet reset sequence: both IN1/IN2 Low >=1.5 ms, then IN1 or IN2 High.
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+  delay(2);
+  digitalWrite(in1, HIGH);
+  delayMicroseconds(50);
+  digitalWrite(in1, LOW);
+
+  if (diagBridgeMode != DiagBridgeMode::Off) {
+    applyDiagBridgeModeOutput();
+  } else {
+    hardDisableStepperPins();
+  }
+
+  lastFault = "NONE";
+  Serial.print("[DIAG] ISD reset sequence applied for stepper");
+  Serial.println(port);
+  server.send(200, "text/plain", "OK");
+}
+
 void handleDiagBridgeMode() {
   if (!server.hasArg("mode")) {
     server.send(400, "text/plain", "Missing mode");
     return;
   }
   String mode = server.arg("mode");
-  if (mode == "m3") {
+  if (mode == "m1") {
+    diagBridgeMode = DiagBridgeMode::M1On;
+  } else if (mode == "m2") {
+    diagBridgeMode = DiagBridgeMode::M2On;
+  } else if (mode == "m3") {
     diagBridgeMode = DiagBridgeMode::M3On;
   } else if (mode == "m4") {
     diagBridgeMode = DiagBridgeMode::M4On;
   } else if (mode == "off") {
     diagBridgeMode = DiagBridgeMode::Off;
   } else {
-    server.send(400, "text/plain", "mode must be off|m3|m4");
+    server.send(400, "text/plain", "mode must be off|m1|m2|m3|m4");
     return;
   }
 
@@ -1983,7 +2124,10 @@ void handleDiagBridgeMode() {
   } else {
     applyDiagBridgeModeOutput();
     Serial.print("[DIAG] bridge test mode=");
-    Serial.println(diagBridgeMode == DiagBridgeMode::M3On ? "M3_ON" : "M4_ON");
+    if (diagBridgeMode == DiagBridgeMode::M1On) Serial.println("M1_ON");
+    else if (diagBridgeMode == DiagBridgeMode::M2On) Serial.println("M2_ON");
+    else if (diagBridgeMode == DiagBridgeMode::M3On) Serial.println("M3_ON");
+    else Serial.println("M4_ON");
   }
 
   server.send(200, "text/plain", "OK");
@@ -2003,11 +2147,13 @@ void setupWeb() {
   server.on("/indexer/set_position_deg", HTTP_POST, handleIndexerSetPositionDeg);
   server.on("/indexer/set_position_gear", HTTP_POST, handleIndexerSetPositionGear);
   server.on("/settings/backlash", HTTP_POST, handleSetBacklash);
+  server.on("/settings/stepper_port", HTTP_POST, handleSetStepperPort);
   server.on("/preset/save", HTTP_POST, handlePresetSave);
   server.on("/preset/load", HTTP_POST, handlePresetLoad);
   server.on("/move/config", HTTP_POST, handleMoveConfig);
   server.on("/config/network", HTTP_POST, handleSaveNetworkConfig);
   server.on("/diag/reset_isd", HTTP_POST, handleDiagResetIsd);
+  server.on("/diag/reset_isd_port", HTTP_POST, handleDiagResetIsdPort);
   server.on("/diag/bridge_mode", HTTP_POST, handleDiagBridgeMode);
   server.begin();
 }
@@ -2333,16 +2479,6 @@ void setup() {
   Serial.println();
   Serial.println("[BOOT] device startup");
   WiFi.onEvent(onWiFiEvent);
-  Serial.print("[BOOT] STEPPER_PORT=");
-  Serial.println(STEPPER_PORT);
-  Serial.print("[BOOT] stepper pins IN1/IN2/IN3/IN4 = ");
-  Serial.print(STEPPER_IN1);
-  Serial.print("/");
-  Serial.print(STEPPER_IN2);
-  Serial.print("/");
-  Serial.print(STEPPER_IN3);
-  Serial.print("/");
-  Serial.println(STEPPER_IN4);
   Serial.println("[BOOT] stepper mode=TB67H450 phase-drive");
   Serial.print("[BOOT] default speed=");
   Serial.println(speedStepsPerSec);
@@ -2363,10 +2499,22 @@ void setup() {
   pinMode(BTN2_PIN, INPUT_PULLUP);
   pinMode(BTN3_PIN, INPUT_PULLUP);
   pinMode(BTN4_PIN, INPUT_PULLUP);
-  pinMode(STEPPER_IN1, OUTPUT);
-  pinMode(STEPPER_IN2, OUTPUT);
-  pinMode(STEPPER_IN3, OUTPUT);
-  pinMode(STEPPER_IN4, OUTPUT);
+  pinMode(STEP1_IN1, OUTPUT);
+  pinMode(STEP1_IN2, OUTPUT);
+  pinMode(STEP1_IN3, OUTPUT);
+  pinMode(STEP1_IN4, OUTPUT);
+  pinMode(STEP2_IN1, OUTPUT);
+  pinMode(STEP2_IN2, OUTPUT);
+  pinMode(STEP2_IN3, OUTPUT);
+  pinMode(STEP2_IN4, OUTPUT);
+  digitalWrite(STEP1_IN1, LOW);
+  digitalWrite(STEP1_IN2, LOW);
+  digitalWrite(STEP1_IN3, LOW);
+  digitalWrite(STEP1_IN4, LOW);
+  digitalWrite(STEP2_IN1, LOW);
+  digitalWrite(STEP2_IN2, LOW);
+  digitalWrite(STEP2_IN3, LOW);
+  digitalWrite(STEP2_IN4, LOW);
 
   bool oledOk = initDisplayWithI2cPins(I2C_SDA_PIN, I2C_SCL_PIN);
   if (!oledOk) {
@@ -2378,6 +2526,16 @@ void setup() {
   }
 
   loadControlSettings();
+  Serial.print("[BOOT] stepper_port=");
+  Serial.println(stepperPort);
+  Serial.print("[BOOT] stepper pins IN1/IN2/IN3/IN4 = ");
+  Serial.print(stepperIn1);
+  Serial.print("/");
+  Serial.print(stepperIn2);
+  Serial.print("/");
+  Serial.print(stepperIn3);
+  Serial.print("/");
+  Serial.println(stepperIn4);
   loadPresets();
   if (uiMoveUnit == MoveUnit::Degrees) {
     uiMoveAmount = degreeStepSetting;
