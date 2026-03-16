@@ -470,8 +470,15 @@ int getCurrentGearFromPosition(long pos) {
     modPos += STEPS_PER_INDEXER_REV;
   }
   int currentGear = 1;
-  if (ticksPerGear > 0 && numberOfGears > 0) {
-    currentGear = static_cast<int>(modPos / ticksPerGear) + 1;
+  if (numberOfGears > 0) {
+    long nearestGearIndex = lround((static_cast<double>(modPos) * static_cast<double>(numberOfGears)) /
+                                   static_cast<double>(STEPS_PER_INDEXER_REV));
+    if (nearestGearIndex >= numberOfGears) {
+      nearestGearIndex = 0;
+    } else if (nearestGearIndex < 0) {
+      nearestGearIndex = 0;
+    }
+    currentGear = static_cast<int>(nearestGearIndex) + 1;
     if (currentGear < 1) {
       currentGear = 1;
     } else if (currentGear > numberOfGears) {
