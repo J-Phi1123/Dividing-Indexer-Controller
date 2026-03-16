@@ -89,8 +89,8 @@ uint8_t stepperIn3 = (STEPPER_PORT == 1) ? STEP1_IN3 : STEP2_IN3;
 uint8_t stepperIn4 = (STEPPER_PORT == 1) ? STEP1_IN4 : STEP2_IN4;
 volatile long stepperPosition = 0;
 volatile long targetPosition = 0;
-float speedStepsPerSec = 5500.0f;
-float accelStepsPerSec2 = 7000.0f;
+float speedStepsPerSec = 4000.0f;
+float accelStepsPerSec2 = 3000.0f;
 float currentSpeedStepsPerSec = 5.0f;
 unsigned long lastDisplayMs = 0;
 constexpr long MOTOR_FULL_STEPS_PER_REV = 200L;
@@ -159,6 +159,8 @@ enum class MoveUnit : uint8_t { Gears = 0, Degrees = 1 };
 MoveUnit uiMoveUnit = MoveUnit::Gears;
 float uiMoveAmount = 1.0f;
 float degreeStepSetting = 10.0f;
+float gearModule = 1.0f;
+float gearPressureAngleDeg = 20.0f;
 double commandedStepsFromZero = 0.0;
 double degreeIdealPosSteps = 0.0;
 bool degreeIdealSynced = false;
@@ -186,6 +188,8 @@ struct MotionPreset {
   float degreeStep;
   float speed;
   float accel;
+  float gearModule;
+  float gearPressureAngleDeg;
 };
 MotionPreset presets[3];
 
@@ -217,8 +221,10 @@ long computeDegreeModeTarget(long currentPos, int dir, float amount);
 void handleDiagResetIsd();
 void handleDiagResetIsdPort();
 void handleDiagBridgeMode();
+void handleDiagTestBacklash();
 void applyStepperPortSelection(uint8_t port);
 void handleSetStepperPort();
+void handleSetGearGeometry();
 
 long modPositive(long value, long mod) {
   long out = value % mod;
@@ -386,17 +392,52 @@ void loadControlSettings() {
   prefs.begin("ctrlcfg", true);
   backlashSteps = prefs.getLong("backlash", 0);
   degreeStepSetting = prefs.getFloat("deg_step", 10.0f);
+  gearModule = prefs.getFloat("gear_module", gearModule);
+  gearPressureAngleDeg = prefs.getFloat("gear_pa", gearPressureAngleDeg);
+  speedStepsPerSec = prefs.getFloat("speed", speedStepsPerSec);
+  accelStepsPerSec2 = prefs.getFloat("accel", accelStepsPerSec2);
+  numberOfGears = prefs.getInt("gears", numberOfGears);
+  uiMoveUnit = prefs.getUChar("move_unit", static_cast<uint8_t>(uiMoveUnit)) == static_cast<uint8_t>(MoveUnit::Degrees)
+                   ? MoveUnit::Degrees
+                   : MoveUnit::Gears;
+  long savedPos = prefs.getLong("index_pos", 0);
   int savedPort = prefs.getInt("stepper_port", STEPPER_PORT);
   prefs.end();
   if (backlashSteps < 0) backlashSteps = 0;
   if (degreeStepSetting <= 0.0f) degreeStepSetting = 10.0f;
+  if (gearModule <= 0.0f) gearModule = 1.0f;
+  if (gearPressureAngleDeg <= 0.0f) gearPressureAngleDeg = 20.0f;
+  if (gearPressureAngleDeg > 45.0f) gearPressureAngleDeg = 45.0f;
+  if (speedStepsPerSec < 5.0f) speedStepsPerSec = 5.0f;
+  if (speedStepsPerSec > 10000.0f) speedStepsPerSec = 10000.0f;
+  if (accelStepsPerSec2 < 5.0f) accelStepsPerSec2 = 5.0f;
+  if (accelStepsPerSec2 > 10000.0f) accelStepsPerSec2 = 10000.0f;
+  if (numberOfGears < 1) numberOfGears = 1;
+  recalcIndexerTicks();
+  long wrappedPos = modPositive(savedPos, STEPS_PER_INDEXER_REV);
+  noInterrupts();
+  stepperPosition = wrappedPos;
+  targetPosition = wrappedPos;
+  commandedStepsFromZero = static_cast<double>(wrappedPos);
+  timerMotionActive = false;
+  lastCommandDir = 0;
+  interrupts();
+  syncDegreeIdealToPosition(wrappedPos);
   applyStepperPortSelection(static_cast<uint8_t>(savedPort));
+  uiMoveAmount = (uiMoveUnit == MoveUnit::Degrees) ? degreeStepSetting : 1.0f;
 }
 
 void saveControlSettings() {
   prefs.begin("ctrlcfg", false);
   prefs.putLong("backlash", backlashSteps);
   prefs.putFloat("deg_step", degreeStepSetting);
+  prefs.putFloat("gear_module", gearModule);
+  prefs.putFloat("gear_pa", gearPressureAngleDeg);
+  prefs.putFloat("speed", speedStepsPerSec);
+  prefs.putFloat("accel", accelStepsPerSec2);
+  prefs.putInt("gears", numberOfGears);
+  prefs.putUChar("move_unit", static_cast<uint8_t>(uiMoveUnit));
+  prefs.putLong("index_pos", getStepperPositionAtomic());
   prefs.putInt("stepper_port", stepperPort);
   prefs.end();
 }
@@ -408,6 +449,8 @@ void loadPresets() {
     presets[i].degreeStep = degreeStepSetting;
     presets[i].speed = speedStepsPerSec;
     presets[i].accel = accelStepsPerSec2;
+    presets[i].gearModule = gearModule;
+    presets[i].gearPressureAngleDeg = gearPressureAngleDeg;
   }
 
   prefs.begin("presets", true);
@@ -429,16 +472,29 @@ void loadPresets() {
     presets[i].degreeStep = raw.substring(b + 1, c).toFloat();
     presets[i].speed = raw.substring(c + 1, d).toFloat();
     int e = raw.indexOf('|', d + 1);
+    int f = (e >= 0) ? raw.indexOf('|', e + 1) : -1;
     if (e >= 0) {
-      // Backward compatibility: ignore legacy trailing motor-current field.
       presets[i].accel = raw.substring(d + 1, e).toFloat();
+      if (f >= 0) {
+        presets[i].gearModule = raw.substring(e + 1, f).toFloat();
+        presets[i].gearPressureAngleDeg = raw.substring(f + 1).toFloat();
+      } else {
+        // Backward compatibility: ignore legacy trailing motor-current field.
+        presets[i].gearModule = gearModule;
+        presets[i].gearPressureAngleDeg = gearPressureAngleDeg;
+      }
     } else {
       presets[i].accel = raw.substring(d + 1).toFloat();
+      presets[i].gearModule = gearModule;
+      presets[i].gearPressureAngleDeg = gearPressureAngleDeg;
     }
     if (presets[i].gears < 1) presets[i].gears = 1;
     if (presets[i].degreeStep <= 0.0f) presets[i].degreeStep = 10.0f;
     if (presets[i].speed < 5.0f) presets[i].speed = 5.0f;
     if (presets[i].accel < 5.0f) presets[i].accel = 5.0f;
+    if (presets[i].gearModule <= 0.0f) presets[i].gearModule = 1.0f;
+    if (presets[i].gearPressureAngleDeg <= 0.0f) presets[i].gearPressureAngleDeg = 20.0f;
+    if (presets[i].gearPressureAngleDeg > 45.0f) presets[i].gearPressureAngleDeg = 45.0f;
   }
   prefs.end();
 }
@@ -449,7 +505,8 @@ void savePresetSlot(int slot) {
   }
   String raw = presets[slot].name + "|" + String(presets[slot].gears) + "|" +
                String(presets[slot].degreeStep, 3) + "|" + String(presets[slot].speed, 1) +
-               "|" + String(presets[slot].accel, 1);
+               "|" + String(presets[slot].accel, 1) + "|" + String(presets[slot].gearModule, 3) +
+               "|" + String(presets[slot].gearPressureAngleDeg, 1);
   prefs.begin("presets", false);
   String key = "p" + String(slot + 1);
   prefs.putString(key.c_str(), raw);
@@ -577,6 +634,7 @@ void handleSetupWizardButtons(bool b1Edge, bool b3Edge, bool b4Edge) {
       recalcIndexerTicks();
       uiMoveAmount = 1.0f;
       degreeIdealSynced = false;
+      saveControlSettings();
       Serial.print("[SETUP] applied gears=");
       Serial.println(numberOfGears);
       setupStage = SetupStage::Zero;
@@ -1385,8 +1443,10 @@ String htmlPage() {
   h += F("@media (max-width:800px){.grid{grid-template-columns:1fr}.shell{padding:10px}button,input{flex:1}}");
   h += F("</style></head><body><div class='shell'><h1 class='title'>Divider Indexer Controller</h1>");
   h += F("<div class='topbar'><button class='secondary' onclick='toggleSettings()'>Settings</button><button class='secondary' onclick='toggleDiagnostics()'>Diagnostics</button><button id='operatorModeBtn' class='secondary' onclick='toggleOperatorMode()'>Lock Operator Screen</button></div>");
-  h += F("<div id='settingsPanel' class='card settings advanced'><div class='row'><input id='speed' type='number' value='5500' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
-  h += F("<div class='row'><input id='accel' type='number' value='7000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
+  h += F("<div id='settingsPanel' class='card settings advanced'><div class='row'><input id='speed' type='number' value='4000' min='5' max='10000' oninput='markDirty(\"speed\")'><button class='secondary' onclick='setSpeed()'>Set Speed</button></div>");
+  h += F("<div class='row'><input id='accel' type='number' value='3000' min='5' max='10000' oninput='markDirty(\"accel\")'><button class='secondary' onclick='setAccel()'>Set Accel</button></div>");
+  h += F("<div class='row'><span class='tiny'>Module (mm)</span><input id='gearModule' type='number' value='1.0' min='0.001' step='0.001' oninput='markDirty(\"gearModule\")'><button class='secondary' onclick='setModule()'>Set Module</button></div>");
+  h += F("<div class='row'><span class='tiny'>Pressure Angle (deg)</span><input id='gearPressureAngle' type='number' value='20.0' min='1' max='45' step='0.1' oninput='markDirty(\"gearPressureAngle\")'><button class='secondary' onclick='setPressureAngle()'>Set Pressure Angle</button></div>");
   h += F("<div class='row'><input id='backlash' type='number' value='0' min='0' step='1' oninput='markDirty(\"backlash\")'><button class='secondary' onclick='setBacklash()'>Set Backlash (steps)</button></div>");
   h += F("<div class='row'><select id='stepperPort' oninput='markDirty(\"stepperPort\")'><option value='1'>Stepper1 (M1/M2)</option><option value='2'>Stepper2 (M3/M4)</option></select><button class='secondary' onclick='setStepperPort()'>Set Stepper Port</button></div>");
   h += F("<div class='row'><input id='setPosDeg' type='number' value='0' min='0' max='360' step='0.001'><button class='secondary' onclick='setPositionDeg()'>Set Absolute Deg</button></div>");
@@ -1395,7 +1455,7 @@ String htmlPage() {
   h += F("<div class='row'><input id='p1name' placeholder='Preset 1 name'><button class='secondary' onclick='presetSave(1)'>Save P1</button><button class='secondary' onclick='presetLoad(1)'>Load P1</button></div>");
   h += F("<div class='row'><input id='p2name' placeholder='Preset 2 name'><button class='secondary' onclick='presetSave(2)'>Save P2</button><button class='secondary' onclick='presetLoad(2)'>Load P2</button></div>");
   h += F("<div class='row'><input id='p3name' placeholder='Preset 3 name'><button class='secondary' onclick='presetSave(3)'>Save P3</button><button class='secondary' onclick='presetLoad(3)'>Load P3</button></div></div>");
-  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD (Active)</button><button class='secondary' onclick='diagResetIsdPort(1)'>Reset ISD S1</button><button class='secondary' onclick='diagResetIsdPort(2)'>Reset ISD S2</button></div><div class='row'><button class='secondary' onclick='diagBridgeMode(\"m1\")'>M1 ON</button><button class='secondary' onclick='diagBridgeMode(\"m2\")'>M2 ON</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
+  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD (Active)</button><button class='secondary' onclick='diagResetIsdPort(1)'>Reset ISD S1</button><button class='secondary' onclick='diagResetIsdPort(2)'>Reset ISD S2</button></div><div class='row'><button class='secondary' onclick='diagBridgeMode(\"m1\")'>M1 ON</button><button class='secondary' onclick='diagBridgeMode(\"m2\")'>M2 ON</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='row'><button class='secondary' onclick='diagTestBacklash()'>Test Backlash</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
   h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
@@ -1475,8 +1535,11 @@ String htmlPage() {
   h += F("function toggleOperatorMode(){document.body.classList.toggle('operator');updateOperatorModeBtn();}");
   h += F("const dirtyFields=new Set();");
   h += F("function markDirty(id){dirtyFields.add(id);}function clearDirty(id){dirtyFields.delete(id);}");
-  h += F("async function setSpeed(){const s=document.getElementById('speed').value||5500;const r=await fetch('/stepper/speed?value='+s,{method:'POST'});if(r.ok)clearDirty('speed');refresh();}");
-  h += F("async function setAccel(){const a=document.getElementById('accel').value||7000;const r=await fetch('/stepper/accel?value='+a,{method:'POST'});if(r.ok)clearDirty('accel');refresh();}");
+  h += F("async function setSpeed(){const s=document.getElementById('speed').value||4000;const r=await fetch('/stepper/speed?value='+s,{method:'POST'});if(r.ok)clearDirty('speed');refresh();}");
+  h += F("async function setAccel(){const a=document.getElementById('accel').value||3000;const r=await fetch('/stepper/accel?value='+a,{method:'POST'});if(r.ok)clearDirty('accel');refresh();}");
+  h += F("async function postGearGeometry(){const m=document.getElementById('gearModule').value||'1';const pa=document.getElementById('gearPressureAngle').value||'20';const p=new URLSearchParams({module:m,pressureAngle:pa});const r=await fetch('/settings/gear_geometry',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});if(!r.ok){alert(await r.text());return false;}return true;}");
+  h += F("async function setModule(){if(await postGearGeometry())clearDirty('gearModule');refresh();}");
+  h += F("async function setPressureAngle(){if(await postGearGeometry())clearDirty('gearPressureAngle');refresh();}");
   h += F("async function setBacklash(){const v=document.getElementById('backlash').value||0;const r=await fetch('/settings/backlash?value='+encodeURIComponent(v),{method:'POST'});if(r.ok)clearDirty('backlash');refresh();}");
   h += F("async function setStepperPort(){const v=document.getElementById('stepperPort').value||'2';const r=await fetch('/settings/stepper_port?value='+encodeURIComponent(v),{method:'POST'});if(r.ok)clearDirty('stepperPort');refresh();}");
   h += F("async function setPositionDeg(){const d=document.getElementById('setPosDeg').value||0;if(!confirm('Set current absolute position to '+d+' degrees?'))return;const r=await fetch('/indexer/set_position_deg?value='+encodeURIComponent(d),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
@@ -1487,6 +1550,7 @@ String htmlPage() {
   h += F("async function diagResetIsd(){const r=await fetch('/diag/reset_isd',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function diagResetIsdPort(port){const r=await fetch('/diag/reset_isd_port?port='+encodeURIComponent(port),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function diagBridgeMode(mode){const r=await fetch('/diag/bridge_mode?mode='+encodeURIComponent(mode),{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
+  h += F("async function diagTestBacklash(){const r=await fetch('/diag/test_backlash',{method:'POST'});if(!r.ok){alert(await r.text());}refresh();}");
   h += F("async function indexStep(dir){await fetch('/indexer/step?dir='+dir,{method:'POST'});refresh();}");
   h += F("function onMoveUnitChanged(){const u=document.getElementById('moveUnit').value;const lbl=document.getElementById('moveLabel');const m=document.getElementById('moveAmount');");
   h += F("if(lbl){lbl.innerText=(u==='degrees')?'Step Degrees':'Total Gears';}if(m){m.min=(u==='degrees')?'0.001':'1';m.step=(u==='degrees')?'0.001':'1';}}");
@@ -1515,11 +1579,11 @@ String htmlPage() {
   h += F("const m=document.getElementById('moveAmount');if(!m)return;m.min=(j.moveUnit==='degrees')?'0.001':'1';m.step=(j.moveUnit==='degrees')?'0.001':'1';");
   h += F("if(document.activeElement!==m&&!dirtyFields.has('moveAmount')){m.value=(j.moveUnit==='degrees')?j.degreeStep:j.gears;}}");
   h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();");
-  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('backlash',j.backlash);setIfIdle('stepperPort',j.stepperPort);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);");
+  h += F("document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('gearModule',j.gearModule);setIfIdle('gearPressureAngle',j.gearPressureAngle);setIfIdle('backlash',j.backlash);setIfIdle('stepperPort',j.stepperPort);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);");
   h += F("const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}");
   h += F("document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';");
   h += F("document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';");
-  h += F("document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nCommanded ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nErr ${j.positionError} steps`;");
+  h += F("document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nCommanded ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nErr ${j.positionError} steps\\nModule ${Number(j.gearModule).toFixed(3)} mm  PA ${Number(j.gearPressureAngle).toFixed(1)} deg\\nO.D. ${Number(j.gearOutsideDiameter).toFixed(3)} mm  Tooth Depth ${Number(j.gearToothDepth).toFixed(3)} mm\\nAngle/Tooth ${Number(j.angleBetweenGears).toFixed(3)} deg`;");
   h += F("const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nBacklash: ${j.backlash} steps\\nBridgeTest: ${j.diagBridgeMode}\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}");
   h += F("renderDial(j.indexerDeg);updateDialContext(j);}");
   h += F("setInterval(refresh,1000);refresh();updateOperatorModeBtn();");
@@ -1538,6 +1602,9 @@ void sendJsonStatus() {
   float cmdDeg = (static_cast<float>(tgt) * 360.0f) /
                  static_cast<float>(STEPS_PER_INDEXER_REV);
   float actualDeg = getIndexerDegrees();
+  float gearOutsideDiameter = gearModule * static_cast<float>(numberOfGears + 2);
+  float gearToothDepth = gearModule * 2.25f;
+  float angleBetweenGears = (numberOfGears > 0) ? (360.0f / static_cast<float>(numberOfGears)) : 0.0f;
   String json = "{";
   json += "\"ip\":\"" + ipAddr.toString() + "\",";
   json += "\"bootIp\":\"" + (bootIpCaptured ? bootIpAddr.toString() : String("")) + "\",";
@@ -1556,6 +1623,11 @@ void sendJsonStatus() {
   json += "\"moveUnit\":\"" + String(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears") + "\",";
   json += "\"moveAmount\":" + String(uiMoveAmount, 3) + ",";
   json += "\"degreeStep\":" + String(degreeStepSetting, 3) + ",";
+  json += "\"gearModule\":" + String(gearModule, 3) + ",";
+  json += "\"gearPressureAngle\":" + String(gearPressureAngleDeg, 1) + ",";
+  json += "\"gearOutsideDiameter\":" + String(gearOutsideDiameter, 3) + ",";
+  json += "\"gearToothDepth\":" + String(gearToothDepth, 3) + ",";
+  json += "\"angleBetweenGears\":" + String(angleBetweenGears, 3) + ",";
   json += "\"speed\":" + String(speedStepsPerSec, 1) + ",";
   json += "\"accel\":" + String(accelStepsPerSec2, 1) + ",";
   json += "\"backlash\":" + String(backlashSteps) + ",";
@@ -1678,6 +1750,7 @@ void handleStepperSpeed() {
   timerStepIntervalRequestUs = stepIntervalUs;
   timerStepIntervalDirty = true;
   interrupts();
+  saveControlSettings();
   Serial.print("[STEP] speed=");
   Serial.println(speedStepsPerSec);
   server.send(200, "text/plain", "OK");
@@ -1696,6 +1769,7 @@ void handleStepperAccel() {
     a = 10000.0f;
   }
   accelStepsPerSec2 = a;
+  saveControlSettings();
   Serial.print("[STEP] accel=");
   Serial.println(accelStepsPerSec2);
   server.send(200, "text/plain", "OK");
@@ -1743,6 +1817,10 @@ void handleIndexerSetGears() {
   }
   numberOfGears = nextGears;
   recalcIndexerTicks();
+  uiMoveUnit = MoveUnit::Gears;
+  uiMoveAmount = 1.0f;
+  degreeIdealSynced = false;
+  saveControlSettings();
   server.send(200, "text/plain", "OK");
 }
 
@@ -1774,6 +1852,7 @@ void handleMoveConfig() {
     recalcIndexerTicks();
     uiMoveAmount = 1.0f;
     degreeIdealSynced = false;
+    saveControlSettings();
   }
   Serial.print("[MOVE] unit=");
   Serial.print(uiMoveUnit == MoveUnit::Degrees ? "degrees" : "gears");
@@ -1791,6 +1870,7 @@ void handleIndexerZero() {
   lastCommandDir = 0;
   interrupts();
   syncDegreeIdealToPosition(0);
+  saveControlSettings();
   Serial.println("[INDEX] zeroed current position reference");
   server.send(200, "text/plain", "OK");
 }
@@ -1821,6 +1901,7 @@ void handleIndexerSetPositionDeg() {
   lastCommandDir = 0;
   interrupts();
   syncDegreeIdealToPosition(pos);
+  saveControlSettings();
   Serial.print("[INDEX] set position deg=");
   Serial.print(deg, 3);
   Serial.print(" steps=");
@@ -1848,6 +1929,7 @@ void handleIndexerSetPositionGear() {
   lastCommandDir = 0;
   interrupts();
   syncDegreeIdealToPosition(pos);
+  saveControlSettings();
   Serial.print("[INDEX] set position gear=");
   Serial.print(gear);
   Serial.print(" steps=");
@@ -1864,6 +1946,27 @@ void handleSetBacklash() {
   if (v < 0) v = 0;
   if (v > 200000) v = 200000;
   backlashSteps = v;
+  saveControlSettings();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetGearGeometry() {
+  if (!server.hasArg("module") || !server.hasArg("pressureAngle")) {
+    server.send(400, "text/plain", "Missing module or pressureAngle");
+    return;
+  }
+  float nextModule = server.arg("module").toFloat();
+  float nextPressureAngle = server.arg("pressureAngle").toFloat();
+  if (nextModule <= 0.0f) {
+    server.send(400, "text/plain", "Module must be > 0");
+    return;
+  }
+  if (nextPressureAngle <= 0.0f || nextPressureAngle > 45.0f) {
+    server.send(400, "text/plain", "Pressure angle must be > 0 and <= 45");
+    return;
+  }
+  gearModule = nextModule;
+  gearPressureAngleDeg = nextPressureAngle;
   saveControlSettings();
   server.send(200, "text/plain", "OK");
 }
@@ -1934,6 +2037,8 @@ void handlePresetSave() {
   presets[i].degreeStep = degreeStepSetting;
   presets[i].speed = speedStepsPerSec;
   presets[i].accel = accelStepsPerSec2;
+  presets[i].gearModule = gearModule;
+  presets[i].gearPressureAngleDeg = gearPressureAngleDeg;
   savePresetSlot(i);
   server.send(200, "text/plain", "OK");
 }
@@ -1963,6 +2068,11 @@ void handlePresetLoad() {
   if (speedStepsPerSec < 5.0f) speedStepsPerSec = 5.0f;
   accelStepsPerSec2 = presets[i].accel;
   if (accelStepsPerSec2 < 5.0f) accelStepsPerSec2 = 5.0f;
+  gearModule = presets[i].gearModule;
+  if (gearModule <= 0.0f) gearModule = 1.0f;
+  gearPressureAngleDeg = presets[i].gearPressureAngleDeg;
+  if (gearPressureAngleDeg <= 0.0f) gearPressureAngleDeg = 20.0f;
+  if (gearPressureAngleDeg > 45.0f) gearPressureAngleDeg = 45.0f;
   applyStepperSpeed();
   noInterrupts();
   timerStepIntervalRequestUs = stepIntervalUs;
@@ -2140,6 +2250,47 @@ void handleDiagBridgeMode() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleDiagTestBacklash() {
+  if (!stepperEnabled) {
+    server.send(409, "text/plain", "Stepper is disabled");
+    return;
+  }
+  if (backlashSteps <= 0) {
+    server.send(400, "text/plain", "Set backlash above 0 first");
+    return;
+  }
+
+  if (stepperOutputsReleased) {
+    hardEnableStepperPins();
+    applyStepperSpeed();
+  }
+
+  int dir = (lastCommandDir > 0) ? -1 : 1;
+  for (int i = 0; i < 6; ++i) {
+    long currentPos = getStepperPositionAtomic();
+    long nextTarget = currentPos + (static_cast<long>(dir) * backlashSteps);
+    nextTarget = applyBacklashCompensation(currentPos, nextTarget);
+    if (nextTarget != currentPos) {
+      showMovingScreen();
+    }
+    setTargetAndCommandedAtomic(nextTarget);
+
+    unsigned long startMs = millis();
+    while (getStepperPositionAtomic() != getTargetPositionAtomic()) {
+      delay(10);
+      if (millis() - startMs > 15000UL) {
+        server.send(504, "text/plain", "Backlash test timed out");
+        return;
+      }
+    }
+    dir = -dir;
+  }
+
+  Serial.print("[DIAG] backlash test complete pos=");
+  Serial.println(modPositive(getStepperPositionAtomic(), STEPS_PER_INDEXER_REV));
+  server.send(200, "text/plain", "OK");
+}
+
 void setupWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
@@ -2154,6 +2305,7 @@ void setupWeb() {
   server.on("/indexer/set_position_deg", HTTP_POST, handleIndexerSetPositionDeg);
   server.on("/indexer/set_position_gear", HTTP_POST, handleIndexerSetPositionGear);
   server.on("/settings/backlash", HTTP_POST, handleSetBacklash);
+  server.on("/settings/gear_geometry", HTTP_POST, handleSetGearGeometry);
   server.on("/settings/stepper_port", HTTP_POST, handleSetStepperPort);
   server.on("/preset/save", HTTP_POST, handlePresetSave);
   server.on("/preset/load", HTTP_POST, handlePresetLoad);
@@ -2162,6 +2314,7 @@ void setupWeb() {
   server.on("/diag/reset_isd", HTTP_POST, handleDiagResetIsd);
   server.on("/diag/reset_isd_port", HTTP_POST, handleDiagResetIsdPort);
   server.on("/diag/bridge_mode", HTTP_POST, handleDiagBridgeMode);
+  server.on("/diag/test_backlash", HTTP_POST, handleDiagTestBacklash);
   server.begin();
 }
 
