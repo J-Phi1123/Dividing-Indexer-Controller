@@ -169,6 +169,10 @@ extern volatile uint64_t totalInterruptStepsTaken;
 extern uint32_t diagIsrTicksPerSec;
 extern uint32_t diagStepRatePerSec;
 extern long missedStepEstimate;
+extern bool diagBacklashTestActive;
+extern int diagBacklashTestDir;
+extern int diagBacklashTestRemainingSegments;
+extern unsigned long diagBacklashPauseUntilMs;
 
 enum class OledPage : uint8_t { Status = 0, Motion = 1, Diag = 2, Setup = 3 };
 extern OledPage oledPage;
@@ -287,6 +291,7 @@ void handleDiagBridgeMode();
 void handleDiagTestBacklash();
 void handleDiagSingleStep();
 void handleDiagResetStepTotal();
+void processDiagBacklashTest();
 void setupWeb();
 
 void setupWifi();

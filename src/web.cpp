@@ -63,7 +63,7 @@ String htmlPage() {
   h += F("<div class='row'><input id='p1name' placeholder='Preset 1 name'><button class='secondary' onclick='presetSave(1)'>Save P1</button><button class='secondary' onclick='presetLoad(1)'>Load P1</button></div>");
   h += F("<div class='row'><input id='p2name' placeholder='Preset 2 name'><button class='secondary' onclick='presetSave(2)'>Save P2</button><button class='secondary' onclick='presetLoad(2)'>Load P2</button></div>");
   h += F("<div class='row'><input id='p3name' placeholder='Preset 3 name'><button class='secondary' onclick='presetSave(3)'>Save P3</button><button class='secondary' onclick='presetLoad(3)'>Load P3</button></div></div>");
-  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD (Active)</button><button class='secondary' onclick='diagResetIsdPort(1)'>Reset ISD S1</button><button class='secondary' onclick='diagResetIsdPort(2)'>Reset ISD S2</button></div><div class='row'><button class='secondary' onclick='diagBridgeMode(\"m1\")'>M1 ON</button><button class='secondary' onclick='diagBridgeMode(\"m2\")'>M2 ON</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='row'><span class='tiny'>Diag Steps/Press</span><input id='diagStepCount' type='number' value='1' min='1' step='1'><button class='secondary' onclick='diagSingleStep(-1)'>Diag Step -</button><button class='secondary' onclick='diagSingleStep(1)'>Diag Step +</button><button class='secondary' onclick='diagTestBacklash()'>Test Backlash</button><button class='secondary' onclick='diagResetStepTotal()'>Reset Step Total</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
+  h += F("<div id='diagPanel' class='card diag advanced'><div class='row'><button class='secondary' onclick='diagResetIsd()'>Reset ISD (Active)</button><button class='secondary' onclick='diagResetIsdPort(1)'>Reset ISD S1</button><button class='secondary' onclick='diagResetIsdPort(2)'>Reset ISD S2</button></div><div class='row'><button class='secondary' onclick='diagBridgeMode(\"m1\")'>M1 ON</button><button class='secondary' onclick='diagBridgeMode(\"m2\")'>M2 ON</button><button class='secondary' onclick='diagBridgeMode(\"m3\")'>M3 ON</button><button class='secondary' onclick='diagBridgeMode(\"m4\")'>M4 ON</button><button class='secondary' onclick='diagBridgeMode(\"off\")'>Bridge OFF</button></div><div class='row'><span class='tiny'>Diag Steps/Press</span><input id='diagStepCount' type='number' value='1' min='1' step='1'></div><div class='row'><button class='secondary' onclick='diagSingleStep(-1)'>Diag Step -</button><button class='secondary' onclick='diagSingleStep(1)'>Diag Step +</button></div><div class='row'><button class='secondary' onclick='diagTestBacklash()'>Test Backlash</button><button class='secondary' onclick='diagResetStepTotal()'>Reset Step Total</button></div><div class='status' id='diagText'>Diagnostics...</div></div>");
   h += F("<div class='grid'>");
   h += F("<div class='card'><div class='dialWrap'>");
   h += F("<svg id='dialSvg' width='250' height='250' viewBox='0 0 250 250' aria-label='Indexer dial'>");
@@ -170,7 +170,7 @@ String htmlPage() {
   h += F("function updateDialContext(j){let prev='-',cur='-',next='-';let prevDeg=0,curDeg=0,nextDeg=0;if(j.moveUnit==='degrees'){const step=Number(j.moveAmount)||1;curDeg=Number(j.indexerDeg)||0;prevDeg=wrapDeg(curDeg-step);nextDeg=wrapDeg(curDeg+step);prev=`${prevDeg.toFixed(3)} deg`;cur=`${curDeg.toFixed(3)} deg`;next=`${nextDeg.toFixed(3)} deg`;}else{const gears=Math.max(1,parseInt(j.gears)||1);const stepDeg=360/gears;const eps=1e-6;curDeg=wrapDeg(Number(j.indexerDeg)||0);const idx=Math.floor(curDeg/stepDeg);const lineDeg=idx*stepDeg;const onLine=Math.abs(curDeg-lineDeg)<eps||Math.abs(curDeg)<eps;let prevGear=1,nextGear=1;if(onLine){const curGear=(idx===0)?gears:idx;prevGear=curGear-1;if(prevGear<1)prevGear=gears;nextGear=curGear+1;if(nextGear>gears)nextGear=1;}else{prevGear=(idx===0)?gears:idx;nextGear=prevGear+1;if(nextGear>gears)nextGear=1;}prevDeg=(prevGear===gears)?360:(prevGear*stepDeg);nextDeg=nextGear*stepDeg;prev=`G${prevGear}/${gears} (~${prevDeg.toFixed(1)} deg)`;cur=`${curDeg.toFixed(3)} deg`;next=`G${nextGear}/${gears} (~${nextDeg.toFixed(1)} deg)`;}setDialMarker('prevNeedle',prevDeg);setDialMarker('nextNeedle',nextDeg);const el=document.getElementById('dialCtx');if(el){el.innerHTML=`Prev: ${prev}<br>Cur: ${cur}<br>Next: ${next}`;}}");
   h += F("function setIfIdle(id,val){const el=document.getElementById(id);if(!el)return;if(document.activeElement===el||dirtyFields.has(id))return;el.value=val;}");
   h += F("function updateMoveUi(j){const lbl=document.getElementById('moveLabel');if(lbl){lbl.innerText=(j.moveUnit==='degrees')?'Step Degrees':'Total Gears';}const m=document.getElementById('moveAmount');if(!m)return;m.min=(j.moveUnit==='degrees')?'0.001':'1';m.step=(j.moveUnit==='degrees')?'0.001':'1';if(document.activeElement!==m&&!dirtyFields.has('moveAmount')){m.value=(j.moveUnit==='degrees')?j.degreeStep:j.gears;}}");
-  h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('gearModule',j.gearModule);setIfIdle('gearPressureAngle',j.gearPressureAngle);setIfIdle('backlash',j.backlash);setIfIdle('slop',j.slop);setIfIdle('stepperPort',j.stepperPort);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nTarget ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nPhysical Cmd ${j.physicalTarget}\\nErr ${j.positionError} steps\\nModule ${Number(j.gearModule).toFixed(3)} mm  PA ${Number(j.gearPressureAngle).toFixed(1)} deg\\nO.D. ${Number(j.gearOutsideDiameter).toFixed(3)} mm  Tooth Depth ${Number(j.gearToothDepth).toFixed(3)} mm\\nAngle/Tooth ${Number(j.angleBetweenGears).toFixed(3)} deg`;const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nTotal ISR Steps: ${j.totalIsrSteps}\\nBacklash: ${j.backlash} steps\\nSlop: ${j.slop} steps\\nBridgeTest: ${j.diagBridgeMode}\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}renderDial(j.indexerDeg);updateDialContext(j);}");
+  h += F("async function refresh(){const r=await fetch('/status');const j=await r.json();document.getElementById('mode').innerText=j.wifiMode;setIfIdle('speed',j.speed);setIfIdle('accel',j.accel);setIfIdle('gearModule',j.gearModule);setIfIdle('gearPressureAngle',j.gearPressureAngle);setIfIdle('backlash',j.backlash);setIfIdle('slop',j.slop);setIfIdle('stepperPort',j.stepperPort);setIfIdle('setPosGear',j.currentGear);setIfIdle('p1name',j.p1);setIfIdle('p2name',j.p2);setIfIdle('p3name',j.p3);updateMoveUi(j);const unitSel=document.getElementById('moveUnit');if(document.activeElement!==unitSel){unitSel.value=j.moveUnit;}document.getElementById('indexPlusBtn').innerText=(j.moveUnit==='degrees')?'+Degree':'+1 Gear';document.getElementById('indexMinusBtn').innerText=(j.moveUnit==='degrees')?'-Degree':'-1 Gear';document.getElementById('status').innerText=`Actual ${j.position} (${Number(j.indexerDeg).toFixed(3)} deg)\\nTarget ${j.target} (${Number(j.cmdDeg).toFixed(3)} deg)\\nModule ${Number(j.gearModule).toFixed(3)} mm  PA ${Number(j.gearPressureAngle).toFixed(1)} deg\\nO.D. ${Number(j.gearOutsideDiameter).toFixed(3)} mm  Tooth Depth ${Number(j.gearToothDepth).toFixed(3)} mm\\nAngle/Tooth ${Number(j.angleBetweenGears).toFixed(3)} deg`;const d=document.getElementById('diagText');if(d){d.innerText=`WiFi: ${j.wifiMode} RSSI=${j.rssi}dBm\\nUptime: ${Math.floor(j.uptimeMs/1000)}s\\nISR: ${j.isrHz} Hz  StepRate: ${j.stepHz} Hz\\nTotal ISR Steps: ${j.totalIsrSteps}\\nBacklash: ${j.backlash} steps\\nSlop: ${j.slop} steps\\nBridgeTest: ${j.diagBridgeMode}\\nFault: ${j.lastFault}\\nMissed(est): ${j.missedEst}`;}renderDial(j.indexerDeg);updateDialContext(j);}");
   h += F("setInterval(refresh,1000);refresh();updateOperatorModeBtn();");
   h += F("</script></body></html>");
   return h;
@@ -798,30 +798,64 @@ void handleDiagTestBacklash() {
     server.send(400, "text/plain", "Set backlash above 0 first");
     return;
   }
+  diagBacklashTestActive = true;
+  diagBacklashTestDir = (lastCommandDir > 0) ? -1 : 1;
+  diagBacklashTestRemainingSegments = 6;
+  diagBacklashPauseUntilMs = 0;
+  server.send(200, "text/plain", "OK");
+}
+
+void processDiagBacklashTest() {
+  if (!diagBacklashTestActive) {
+    return;
+  }
+  if (!stepperEnabled) {
+    diagBacklashTestActive = false;
+    diagBacklashTestRemainingSegments = 0;
+    diagBacklashPauseUntilMs = 0;
+    return;
+  }
+  if (getStepperPositionAtomic() != getTargetPositionAtomic()) {
+    return;
+  }
+  if (halfStepInProgress) {
+    return;
+  }
+  if (diagBacklashTestRemainingSegments <= 0) {
+    diagBacklashTestActive = false;
+    diagBacklashPauseUntilMs = 0;
+    syncIndexedLogicalPosition(getStepperPositionAtomic());
+    return;
+  }
+  if (diagBacklashPauseUntilMs == 1) {
+    diagBacklashPauseUntilMs = millis() + 1000UL;
+    return;
+  }
+  if (diagBacklashPauseUntilMs != 0 && millis() < diagBacklashPauseUntilMs) {
+    return;
+  }
+  diagBacklashPauseUntilMs = 0;
+
+  applyStepperSpeed();
+  currentSpeedStepsPerSec = START_SPEED_STEPS_PER_SEC;
+  lastRampUs = micros();
   if (stepperOutputsReleased) {
     hardEnableStepperPins();
-    applyStepperSpeed();
   }
-  int dir = (lastCommandDir > 0) ? -1 : 1;
-  for (int i = 0; i < 6; ++i) {
-    long currentPos = getStepperPositionAtomic();
-    long nextTarget = applyBacklashCompensation(currentPos, currentPos + (static_cast<long>(dir) * backlashSteps));
-    if (nextTarget != currentPos) showMovingScreen();
-    setTargetAndCommandedAtomic(nextTarget);
-    unsigned long startMs = millis();
-    while (getStepperPositionAtomic() != getTargetPositionAtomic()) {
-      delay(10);
-      if (millis() - startMs > 15000UL) {
-        server.send(504, "text/plain", "Backlash test timed out");
-        return;
-      }
-    }
-    dir = -dir;
+
+  long currentPos = getStepperPositionAtomic();
+  long nextTarget = applyBacklashCompensation(
+      currentPos, currentPos + (static_cast<long>(diagBacklashTestDir) * backlashSteps));
+  if (nextTarget == currentPos) {
+    diagBacklashTestRemainingSegments = 0;
+    diagBacklashTestActive = false;
+    return;
   }
-  Serial.print("[DIAG] backlash test complete pos=");
-  Serial.println(modPositive(getStepperPositionAtomic(), STEPS_PER_INDEXER_REV));
-  syncIndexedLogicalPosition(getStepperPositionAtomic());
-  server.send(200, "text/plain", "OK");
+  showMovingScreen();
+  setTargetAndCommandedAtomic(nextTarget);
+  diagBacklashTestDir = -diagBacklashTestDir;
+  diagBacklashTestRemainingSegments--;
+  diagBacklashPauseUntilMs = 1;
 }
 
 void handleDiagSingleStep() {

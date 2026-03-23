@@ -4,6 +4,7 @@ const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID = "MakerESP32-Stepper";
 const char* AP_PASS = "stepper123";
+constexpr bool ENABLE_UART_DEBUG = false;
 
 WebServer server(80);
 Preferences prefs;
@@ -82,6 +83,10 @@ volatile uint64_t totalInterruptStepsTaken = 0;
 uint32_t diagIsrTicksPerSec = 0;
 uint32_t diagStepRatePerSec = 0;
 long missedStepEstimate = 0;
+bool diagBacklashTestActive = false;
+int diagBacklashTestDir = 1;
+int diagBacklashTestRemainingSegments = 0;
+unsigned long diagBacklashPauseUntilMs = 0;
 
 OledPage oledPage = OledPage::Status;
 DiagBridgeMode diagBridgeMode = DiagBridgeMode::Off;
@@ -470,10 +475,12 @@ void handleButtonActions() {
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println();
-  Serial.println("[BOOT] device startup");
+  if (ENABLE_UART_DEBUG) {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println();
+    Serial.println("[BOOT] device startup");
+  }
   WiFi.onEvent(onWiFiEvent);
   Serial.println("[BOOT] stepper mode=TB67H450 phase-drive");
   Serial.print("[BOOT] default speed=");
@@ -665,6 +672,8 @@ void loop() {
   } else if (!stepperOutputsReleased) {
     hardDisableStepperPins();
   }
+
+  processDiagBacklashTest();
 
   bool movingNow = stepperEnabled && (stepperPosition != targetPosition);
   if (wasMoving && !movingNow) {
