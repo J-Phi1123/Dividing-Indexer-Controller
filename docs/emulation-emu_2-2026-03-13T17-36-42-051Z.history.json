@@ -1,0 +1,61 @@
+{
+  "format": "inquistor-emulation-history-v1",
+  "exported_utc": "2026-03-13T17:36:42.049849+00:00",
+  "source_session_id": "emu_2",
+  "syscall_trace": [
+    {
+      "name": "brk",
+      "args": {
+        "target": 0
+      },
+      "ret": 204800
+    },
+    {
+      "name": "brk",
+      "args": {
+        "target": 208048
+      },
+      "ret": 208048
+    },
+    {
+      "name": "arm_set_tls",
+      "args": {
+        "tls": 205968
+      },
+      "ret": 0
+    },
+    {
+      "name": "brk",
+      "args": {
+        "target": 211312
+      },
+      "ret": 211312
+    },
+    {
+      "name": "arm_set_tls",
+      "args": {
+        "tls": 209216
+      },
+      "ret": 0
+    },
+    {
+      "name": "ioctl",
+      "args": {
+        "fd": 0,
+        "request": 21505,
+        "argp": 2147413284
+      },
+      "ret": 0
+    },
+    {
+      "name": "ioctl",
+      "args": {
+        "fd": 1,
+        "request": 21505,
+        "argp": 2147413284
+      },
+      "ret": 0
+    }
+  ],
+  "stdio_log": []
+}
